@@ -1,0 +1,19 @@
+bedrock:
+  address: 0.0.0.0
+  port: 19132
+  clone-remote-port: false
+  motd1: "My Server"
+  motd2: "Bedrock supported!"
+  server-name: "My Server"
+
+remote:
+  address: minecraft
+  port: 25565
+  auth-type: online
+
+passthrough-motd: true
+passthrough-player-counts: true
+allow-third-party-capes: true
+show-cooldown: title
+
+config-version: 4
