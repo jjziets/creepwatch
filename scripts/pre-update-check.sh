@@ -16,8 +16,15 @@ if [ "$count" -gt 0 ]; then
     [ -z "$names" ] && names="(unknown)"
     echo "[pre-update] $count player(s) online — skipping update: $names"
 
-    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${ADMIN_CHAT_IDS:-}" ] && command -v curl >/dev/null 2>&1; then
-        msg=$(printf "🟡 Minecraft auto-update postponed: %s player(s) online (%s). Will retry tomorrow at 2am." "$count" "$names")
+    # Notify at most once every 12 hours so the nightly retry window
+    # (e.g. hourly 01:00–08:00) only produces a single skip ping.
+    notify_marker=/data/.creepwatch_last_skip_notify
+    last_ts=$(cat "$notify_marker" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    elapsed=$((now - last_ts))
+
+    if [ "$elapsed" -gt 43200 ] && [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${ADMIN_CHAT_IDS:-}" ] && command -v curl >/dev/null 2>&1; then
+        msg=$(printf "🟡 Minecraft auto-update postponed: %s player(s) online (%s). Will retry within the nightly update window." "$count" "$names")
         IFS=','
         for chat in $ADMIN_CHAT_IDS; do
             curl -s -m 5 -X POST \
@@ -25,6 +32,7 @@ if [ "$count" -gt 0 ]; then
                 --data-urlencode "chat_id=$chat" \
                 --data-urlencode "text=$msg" >/dev/null 2>&1 || true
         done
+        echo "$now" > "$notify_marker" 2>/dev/null || true
     fi
     exit 1
 fi

@@ -85,18 +85,27 @@ prefs.
 ## Auto-update protection
 
 The Watchtower service in the bundled Compose stack pulls a fresh
-`itzg/minecraft-server:latest` every night at 02:00 UTC. Updates are gated by
-a Watchtower **pre-update lifecycle hook**
-(`scripts/pre-update-check.sh`) that runs `rcon-cli list` inside the minecraft
-container — if any player is online, the script exits non-zero and Watchtower
-skips the cycle, then notifies both admins via Telegram:
+`itzg/minecraft-server:latest` once an hour from **01:00 to 08:00** —
+8 chances per night to land on an empty lobby. Set `TZ` in `.env` to make
+that window match your wall clock; defaults to UTC.
+
+Each attempt runs a Watchtower **pre-update lifecycle hook**
+(`scripts/pre-update-check.sh`) that calls `rcon-cli list` inside the
+minecraft container. If anyone is online the script exits non-zero and
+Watchtower skips this cycle — the running server is never restarted out
+from under players. Both admins get one Telegram heads-up per night when
+the first attempt is skipped:
 
 ```
-🟡 Minecraft auto-update postponed: 2 player(s) online (Steve, Alex). Will retry tomorrow at 2am.
+🟡 Minecraft auto-update postponed: 2 player(s) online (Steve, Alex). Will retry within the nightly update window.
 ```
 
-When the lobby is empty, the update proceeds normally and creepwatch's own
-version-change detection broadcasts `🆙 Minecraft updated! X → Y`.
+(Subsequent skip attempts in the same 12-hour window stay silent.)
+
+The first idle hour wins: as soon as the lobby is empty the update
+proceeds, creepwatch broadcasts the routine `🛑 stopping → 🟢 ready`,
+and the version-change detector adds `🆙 Minecraft updated! X → Y` if
+a new MC version landed.
 
 ## License
 

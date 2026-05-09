@@ -68,14 +68,18 @@ services:
     networks:
       - minecraft_net
 
-  # Auto-updater - checks for new images every night at 2am
+  # Auto-updater - checks for new images hourly from 01:00 to 08:00.
+  # Each attempt runs the pre-update hook on the minecraft container; if any
+  # player is online the cycle is skipped, so the retry window catches the
+  # first idle hour. TZ controls what wall-clock the schedule maps to.
   watchtower-minecraft:
     image: containrrr/watchtower
     container_name: watchtower-minecraft
     restart: unless-stopped
     environment:
+      - TZ=${TZ:-UTC}
       - WATCHTOWER_CLEANUP=true
-      - WATCHTOWER_SCHEDULE=0 0 2 * * *
+      - WATCHTOWER_SCHEDULE=0 0 1-8 * * *
       - WATCHTOWER_LABEL_ENABLE=true
       - WATCHTOWER_INCLUDE_STOPPED=true
       - WATCHTOWER_ROLLING_RESTART=true
