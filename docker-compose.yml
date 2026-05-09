@@ -1,0 +1,88 @@
+services:
+  minecraft:
+    image: itzg/minecraft-server:latest
+    container_name: minecraft
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    ports:
+      - "25565:25565/tcp"
+    environment:
+      EULA: "TRUE"
+      TYPE: "VANILLA"
+      VERSION: "LATEST"
+      MEMORY: "4G"
+      SERVER_NAME: "${SERVER_NAME:-Minecraft}"
+      MOTD: "${MOTD:-Welcome!}"
+      MAX_PLAYERS: 20
+      DIFFICULTY: "normal"
+      MODE: "survival"
+      PVP: "true"
+      ALLOW_NETHER: "true"
+      ENABLE_COMMAND_BLOCK: "true"
+      VIEW_DISTANCE: 12
+      ENABLE_WHITELIST: "true"
+      ENFORCE_WHITELIST: "true"
+    volumes:
+      - minecraft_data:/data
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    networks:
+      - minecraft_net
+
+  # Optional Bedrock bridge
+  geyser:
+    build: ./geyser
+    container_name: geyser
+    restart: unless-stopped
+    ports:
+      - "19132:19132/udp"
+    volumes:
+      - ./geyser/config.yml:/geyser/config.yml
+    depends_on:
+      - minecraft
+    networks:
+      - minecraft_net
+
+  # Telegram bot - whitelist guard, join/leave alerts, /settings per admin
+  mc-guard:
+    image: python:3.12-slim
+    container_name: mc-guard
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ADMIN_CHAT_IDS=${ADMIN_CHAT_IDS}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker
+      - ./mc_guard.py:/app/mc_guard.py
+      - ./data:/data
+    command: bash -c "pip install requests -q && python /app/mc_guard.py"
+    depends_on:
+      - minecraft
+    networks:
+      - minecraft_net
+
+  # Auto-updater - checks for new images every night at 2am
+  watchtower-minecraft:
+    image: containrrr/watchtower
+    container_name: watchtower-minecraft
+    restart: unless-stopped
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_SCHEDULE=0 0 2 * * *
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_INCLUDE_STOPPED=true
+      - WATCHTOWER_ROLLING_RESTART=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - minecraft_net
+
+volumes:
+  minecraft_data:
+    name: minecraft_data
+
+networks:
+  minecraft_net:
+    driver: bridge
