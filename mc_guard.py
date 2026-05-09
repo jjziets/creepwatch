@@ -9,6 +9,18 @@ Minecraft Whitelist Guard Bot
 import subprocess, requests, time, re, logging, os, threading, pathlib, json, datetime
 from zoneinfo import ZoneInfo
 
+
+# ── Telegram Markdown escaping ─────────────────────────────────────────────────
+
+def md_escape(s: str) -> str:
+    """Escape Telegram legacy Markdown special characters in user-controlled text.
+
+    Telegram's legacy ``parse_mode=Markdown`` treats ``_ * [ ] ``` as
+    formatting markers.  Player names, error messages, and other untrusted
+    strings must be escaped before interpolation into format strings.
+    """
+    return re.sub(r"([_*\[\]`])", r"\\\1", s)
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
@@ -57,7 +69,13 @@ def send(chat_id: int, text: str, keyboard=None):
     if keyboard:
         payload["reply_markup"] = keyboard
     try:
-        requests.post(f"{API}/sendMessage", json=payload, timeout=10)
+        r = requests.post(f"{API}/sendMessage", json=payload, timeout=10)
+        if not r.ok:
+            log.warning(f"sendMessage returned {r.status_code}: {r.text[:200]}")
+        else:
+            data = r.json()
+            if not data.get("ok"):
+                log.warning(f"sendMessage failed: {data}")
     except Exception as e:
         log.warning(f"send error: {e}")
 
@@ -67,10 +85,16 @@ def broadcast(text: str):
 
 def edit(chat_id: int, msg_id: int, text: str):
     try:
-        requests.post(f"{API}/editMessageText", json={
+        r = requests.post(f"{API}/editMessageText", json={
             "chat_id": chat_id, "message_id": msg_id,
             "text": text, "parse_mode": "Markdown",
         }, timeout=10)
+        if not r.ok:
+            log.warning(f"editMessageText returned {r.status_code}: {r.text[:200]}")
+        else:
+            data = r.json()
+            if not data.get("ok"):
+                log.warning(f"editMessageText failed: {data}")
     except Exception as e:
         log.warning(f"edit error: {e}")
 
@@ -173,7 +197,7 @@ def cmd_remove(chat_id: int, player: str, admin_name: str):
         return
     out = rcon(f"whitelist remove {player}")
     log.info(f"Removed {player} by {admin_name}: {out}")
-    text = f"🚫 *{player}* removed from whitelist by {admin_name}."
+    text = f"🚫 *{md_escape(player)}* removed from whitelist by {md_escape(admin_name)}."
     send(chat_id, text)
     notify_event("rejects", text, exclude=chat_id)
 
@@ -183,7 +207,7 @@ def cmd_approve(chat_id: int, player: str, admin_name: str):
         return
     out = rcon(f"whitelist add {player}")
     log.info(f"Approved {player} by {admin_name}: {out}")
-    text = f"✅ *{player}* added to whitelist by {admin_name}."
+    text = f"✅ *{md_escape(player)}* added to whitelist by {md_escape(admin_name)}."
     send(chat_id, text)
     notify_event("approvals", text, exclude=chat_id)
 
@@ -244,7 +268,7 @@ def cmd_unblock(chat_id: int, player: str, admin_name: str):
         send(chat_id, "Usage: /unblock `<player>`")
         return
     unblock_player(player)
-    text = f"✅ *{player}* unblocked by {admin_name}. They can request access again."
+    text = f"✅ *{md_escape(player)}* unblocked by {md_escape(admin_name)}. They can request access again."
     send(chat_id, text)
     notify_event("approvals", text, exclude=chat_id)
 
@@ -277,7 +301,7 @@ def send_approval_request(player: str):
     for cid in ADMIN_CHAT_IDS:
         r = requests.post(f"{API}/sendMessage", json={
             "chat_id": cid,
-            "text": f"🎮 *New player wants to join!*\n\nPlayer: `{player}`\n\nAllow them on the Vast Family Minecraft server?",
+            "text": f"🎮 *New player wants to join!*\n\nPlayer: `{md_escape(player)}`\n\nAllow them on the Vast Family Minecraft server?",
             "parse_mode": "Markdown",
             "reply_markup": keyboard,
         }, timeout=10)
@@ -355,11 +379,11 @@ def poll_callbacks():
         if action == "allow":
             out = rcon(f"whitelist add {player}")
             log.info(f"whitelist add {player} by {admin_name}: {out}")
-            result_text = f"✅ *{player}* was allowed by {admin_name}."
+            result_text = f"✅ *{md_escape(player)}* was allowed by {md_escape(admin_name)}."
             pref_key = "approvals"
         elif action == "deny":
             block_player(player)
-            result_text = f"❌ *{player}* was denied by {admin_name} and added to the blocked list."
+            result_text = f"❌ *{md_escape(player)}* was denied by {md_escape(admin_name)} and added to the blocked list."
             log.info(f"Denied and blocked {player} by {admin_name}")
             pref_key = "rejects"
         else:
@@ -460,18 +484,18 @@ def main():
             now = time.time()
             if now - recent_errors.get(sig, 0) > ERROR_COOLDOWN:
                 recent_errors[sig] = now
-                safe = err.replace("`", "'")[:500]
+                safe = md_escape(err[:500])
                 notify_event("errors", f"⚠️ *Server error*\n`{safe}`")
             continue
 
         m = JOINED_RE.search(line)
         if m:
-            notify_event("joins", f"🟢 *{m.group(1)}* joined the game.")
+            notify_event("joins", f"🟢 *{md_escape(m.group(1))}* joined the game.")
             continue
 
         m = LEFT_RE.search(line)
         if m:
-            notify_event("leaves", f"⚪ *{m.group(1)}* left the game.")
+            notify_event("leaves", f"⚪ *{md_escape(m.group(1))}* left the game.")
             continue
 
         player = extract_player(line)
