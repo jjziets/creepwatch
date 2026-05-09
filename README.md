@@ -107,6 +107,34 @@ proceeds, creepwatch broadcasts the routine `🛑 stopping → 🟢 ready`,
 and the version-change detector adds `🆙 Minecraft updated! X → Y` if
 a new MC version landed.
 
+## Backups
+
+`scripts/backup.sh` produces a nightly tarball of the Minecraft world without
+kicking players. The flow is the standard quiesce-and-snapshot pattern:
+
+1. `rcon save-all flush` — flush pending writes.
+2. `rcon save-off` — pause autosave.
+3. Tar the `minecraft_data` volume from an ephemeral `alpine:latest` container.
+4. `rcon save-on` — resume autosave (always runs, even if the snapshot fails).
+
+Tarballs land in `/home/vast/minecraft/backups/minecraft-<UTC>.tar.gz` and are
+pruned after **7 days** (override via `BACKUP_RETENTION_DAYS`). Failures are
+reported to Telegram via the same `TELEGRAM_BOT_TOKEN`/`ADMIN_CHAT_IDS` used
+by mc-guard; successful backups stay silent so you don't get a daily ping.
+
+The schedule lives in `systemd/minecraft-backup.{service,timer}`. Install once:
+
+```sh
+sudo cp systemd/minecraft-backup.service systemd/minecraft-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now minecraft-backup.timer
+```
+
+The timer fires at **04:00 host-local** every day and slips into the existing
+01:00–08:00 quiet window. Push backups off-host (S3, Backblaze, rsync to a
+sibling box, …) by extending the script with `rclone` or `rsync` after the
+`log "backup complete"` line.
+
 ## License
 
 MIT

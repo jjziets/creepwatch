@@ -1,0 +1,11 @@
+[Unit]
+Description=creepwatch — daily Minecraft world backup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/vast/minecraft/scripts/backup.sh
+User=root
+StandardOutput=journal
+StandardError=journal

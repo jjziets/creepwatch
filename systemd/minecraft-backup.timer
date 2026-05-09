@@ -1,0 +1,14 @@
+[Unit]
+Description=creepwatch — run Minecraft world backup nightly at 04:00 local
+
+[Timer]
+# 04:00 in the host's local timezone. The host TZ should be set to wherever
+# you want this to land (timedatectl set-timezone Africa/Johannesburg, etc).
+# Persistent=true makes systemd run a missed backup once on boot if the host
+# was powered off at the scheduled time.
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
