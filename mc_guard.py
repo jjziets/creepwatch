@@ -26,6 +26,10 @@ LOST_CONN_RE  = re.compile(r"(\w+) \([^)]+\) lost connection: You are not white-
 DISCONNECT_RE = re.compile(r"Disconnecting (\w+) \([^)]+\): You are not white-listed", re.IGNORECASE)
 JOINED_RE     = re.compile(r"\]: (\w+) joined the game\s*$")
 LEFT_RE       = re.compile(r"\]: (\w+) left the game\s*$")
+READY_RE      = re.compile(r"Done \([0-9.]+s\)!")
+STOPPING_RE   = re.compile(r"Stopping( the)? server", re.IGNORECASE)
+ERROR_RE      = re.compile(r"\[\d+:\d+:\d+\] \[[^\]]+/ERROR\]:?\s*(.+?)\s*$")
+ERROR_COOLDOWN = 600  # seconds — collapse repeated identical errors
 
 
 # ── RCON helpers ──────────────────────────────────────────────────────────────
@@ -67,7 +71,14 @@ def edit(chat_id: int, msg_id: int, text: str):
 
 BLOCKED_FILE  = pathlib.Path("/data/blocked_players.txt")
 PREFS_FILE    = pathlib.Path("/data/notify_prefs.json")
-DEFAULT_PREFS = {"joins": True, "leaves": True, "approvals": True, "rejects": True}
+DEFAULT_PREFS = {
+    "joins":     True,
+    "leaves":    True,
+    "approvals": True,
+    "rejects":   True,
+    "restarts":  True,
+    "errors":    True,
+}
 
 def blocked_list() -> set:
     if BLOCKED_FILE.exists():
@@ -115,9 +126,11 @@ def settings_keyboard(prefs: dict) -> dict:
         [{"text": f"Leaves:    {fmt(prefs['leaves'])}",    "callback_data": "toggle:leaves"}],
         [{"text": f"Approvals: {fmt(prefs['approvals'])}", "callback_data": "toggle:approvals"}],
         [{"text": f"Rejects:   {fmt(prefs['rejects'])}",   "callback_data": "toggle:rejects"}],
+        [{"text": f"Restarts:  {fmt(prefs['restarts'])}",  "callback_data": "toggle:restarts"}],
+        [{"text": f"Errors:    {fmt(prefs['errors'])}",    "callback_data": "toggle:errors"}],
     ]}
 
-TOGGLE_KEYS = ("joins", "leaves", "approvals", "rejects")
+TOGGLE_KEYS = ("joins", "leaves", "approvals", "rejects", "restarts", "errors")
 
 
 HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
@@ -137,7 +150,7 @@ HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
 /status · /st — server version and player count
 
 *Notifications*
-/settings · /se — toggle your join, leave, approval, reject alerts
+/settings · /se — toggle your join, leave, approval, reject, restart, error alerts
 
 /help · /h — show this message"""
 
@@ -376,7 +389,7 @@ def check_version_and_notify():
     m = re.search(r"(\d+\.\d+[\.\d]*)", ver_out)
     current_version = m.group(1) if m else ver_out.strip()
 
-    version_file = pathlib.Path("/tmp/mc_last_version")
+    version_file = pathlib.Path("/data/mc_last_version")
     last_version  = version_file.read_text().strip() if version_file.exists() else None
 
     if current_version != last_version:
@@ -400,6 +413,7 @@ def main():
     threading.Thread(target=check_version_and_notify, daemon=False).start()
 
     already_notified = set()
+    recent_errors    = {}  # signature -> last_seen_ts
 
     def callback_loop():
         while True:
@@ -412,6 +426,25 @@ def main():
     threading.Thread(target=callback_loop, daemon=True).start()
 
     for line in tail_logs():
+        if READY_RE.search(line):
+            notify_event("restarts", "🟢 Minecraft server is ready.")
+            continue
+
+        if STOPPING_RE.search(line):
+            notify_event("restarts", "🛑 Minecraft server is stopping.")
+            continue
+
+        m = ERROR_RE.search(line)
+        if m:
+            err = m.group(1).strip()
+            sig = err[:80]
+            now = time.time()
+            if now - recent_errors.get(sig, 0) > ERROR_COOLDOWN:
+                recent_errors[sig] = now
+                safe = err.replace("`", "'")[:500]
+                notify_event("errors", f"⚠️ *Server error*\n`{safe}`")
+            continue
+
         m = JOINED_RE.search(line)
         if m:
             notify_event("joins", f"🟢 *{m.group(1)}* joined the game.")
