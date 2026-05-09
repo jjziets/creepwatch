@@ -6,7 +6,8 @@ Minecraft Whitelist Guard Bot
 - Slash commands for server management
 - Only notifies on actual Minecraft version updates (not routine restarts)
 """
-import subprocess, requests, time, re, logging, os, threading, pathlib, json
+import subprocess, requests, time, re, logging, os, threading, pathlib, json, datetime
+from zoneinfo import ZoneInfo
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -18,6 +19,13 @@ API       = f"https://api.telegram.org/bot{BOT_TOKEN}"
 # Comma-separated Telegram chat IDs of admins who can manage the server
 # and receive notifications. Example: ADMIN_CHAT_IDS=111111,222222
 ADMIN_CHAT_IDS = [int(x) for x in os.environ["ADMIN_CHAT_IDS"].split(",") if x.strip()]
+
+# Display timezone for human-facing timestamps (e.g. /activity output).
+# Falls back to UTC if the named zone is missing.
+try:
+    DISPLAY_TZ = ZoneInfo(os.environ.get("TZ", "UTC"))
+except Exception:
+    DISPLAY_TZ = ZoneInfo("UTC")
 
 pending = {}  # msg_id -> player
 offset  = 0
@@ -185,19 +193,30 @@ def cmd_online(chat_id: int):
 
 def cmd_activity(chat_id: int):
     try:
+        # `-t` prepends each line with docker's RFC3339 UTC timestamp,
+        # which we re-render in the display timezone — independent of
+        # whatever timezone the minecraft container itself logs in.
         result = subprocess.run(
-            ["docker", "logs", "--tail", "500", "minecraft"],
+            ["docker", "logs", "-t", "--tail", "500", "minecraft"],
             capture_output=True, text=True, timeout=15
         )
         lines = (result.stdout + result.stderr).splitlines()
         events = []
         for line in lines:
-            if any(x in line for x in ("joined the game", "left the game", "lost connection")):
-                m = re.search(r'\[(\d+:\d+:\d+)\].*INFO\]: (.+)', line)
-                if m:
-                    events.append(f"`{m.group(1)}` {m.group(2)}")
+            if not any(x in line for x in ("joined the game", "left the game", "lost connection")):
+                continue
+            m = re.match(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\S*\s+.*INFO\]:\s*(.+)$', line)
+            if not m:
+                continue
+            try:
+                ts_utc   = datetime.datetime.fromisoformat(m.group(1)).replace(tzinfo=datetime.timezone.utc)
+                ts_local = ts_utc.astimezone(DISPLAY_TZ)
+                events.append(f"`{ts_local.strftime('%H:%M')}` {m.group(2)}")
+            except Exception as e:
+                log.warning(f"activity parse error: {e}")
         if events:
-            send(chat_id, "📜 *Recent activity*\n" + "\n".join(events[-20:]))
+            tz_label = DISPLAY_TZ.key if hasattr(DISPLAY_TZ, "key") else str(DISPLAY_TZ)
+            send(chat_id, f"📜 *Recent activity* ({tz_label})\n" + "\n".join(events[-20:]))
         else:
             send(chat_id, "📜 No recent activity found.")
     except Exception as e:

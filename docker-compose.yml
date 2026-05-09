@@ -23,6 +23,7 @@ services:
       VIEW_DISTANCE: 12
       ENABLE_WHITELIST: "true"
       ENFORCE_WHITELIST: "true"
+      TZ: "${TZ:-UTC}"
       # Used only by /pre-update-check.sh to notify on skip
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
       ADMIN_CHAT_IDS:    "${ADMIN_CHAT_IDS}"
@@ -57,12 +58,14 @@ services:
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - ADMIN_CHAT_IDS=${ADMIN_CHAT_IDS}
+      - TZ=${TZ:-UTC}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /usr/bin/docker:/usr/bin/docker
       - ./mc_guard.py:/app/mc_guard.py
       - ./data:/data
-    command: bash -c "pip install requests -q && python /app/mc_guard.py"
+    # tzdata lets Python's ZoneInfo resolve named zones inside the slim image.
+    command: bash -c "pip install requests tzdata -q && python /app/mc_guard.py"
     depends_on:
       - minecraft
     networks:
