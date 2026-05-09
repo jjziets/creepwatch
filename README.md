@@ -82,6 +82,22 @@ it requires action, so it isn't gated. Whoever runs `/approve`, `/remove`, or
 `/unblock` always gets a confirmation in their own chat regardless of their own
 prefs.
 
+## Auto-update protection
+
+The Watchtower service in the bundled Compose stack pulls a fresh
+`itzg/minecraft-server:latest` every night at 02:00 UTC. Updates are gated by
+a Watchtower **pre-update lifecycle hook**
+(`scripts/pre-update-check.sh`) that runs `rcon-cli list` inside the minecraft
+container — if any player is online, the script exits non-zero and Watchtower
+skips the cycle, then notifies both admins via Telegram:
+
+```
+🟡 Minecraft auto-update postponed: 2 player(s) online (Steve, Alex). Will retry tomorrow at 2am.
+```
+
+When the lobby is empty, the update proceeds normally and creepwatch's own
+version-change detection broadcasts `🆙 Minecraft updated! X → Y`.
+
 ## License
 
 MIT
