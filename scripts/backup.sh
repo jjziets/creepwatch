@@ -18,10 +18,13 @@ ARCHIVE_NAME="minecraft-${TIMESTAMP}.tar.gz"
 
 mkdir -p "$BACKUP_DIR"
 
-if [ -f /home/vast/minecraft/.env ]; then
-    set -a
-    . /home/vast/minecraft/.env
-    set +a
+env_file=/home/vast/minecraft/.env
+if [ -f "$env_file" ]; then
+    # Compose-style .env values may contain spaces, so don't `source` them.
+    # Pluck the two keys we need with a literal grep.
+    TELEGRAM_BOT_TOKEN=$(grep -m1 '^TELEGRAM_BOT_TOKEN=' "$env_file" | cut -d= -f2-)
+    ADMIN_CHAT_IDS=$(grep -m1 '^ADMIN_CHAT_IDS=' "$env_file" | cut -d= -f2-)
+    export TELEGRAM_BOT_TOKEN ADMIN_CHAT_IDS
 fi
 
 log() { printf '[%s backup] %s\n' "$(date -u +%FT%TZ)" "$*"; }
