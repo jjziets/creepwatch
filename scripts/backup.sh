@@ -6,10 +6,19 @@
 # autosave. Players are not kicked. The save-on step is unconditional so we
 # never leave the world frozen, even if the snapshot fails.
 #
-# Failures (and only failures) are reported to Telegram if TELEGRAM_BOT_TOKEN
-# and ADMIN_CHAT_IDS are present in /home/vast/minecraft/.env.
+# Failures (and only failures) are reported to Telegram when TELEGRAM_BOT_TOKEN
+# and ADMIN_CHAT_IDS are set (Compose env) or plucked from CREEPWATCH_ENV_FILE
+# (host cron) or the legacy default path.
 
 set -u
+
+docker_cli() {
+    if [ -n "${DOCKER_REAL:-}" ] && [ -x "${DOCKER_REAL}" ]; then
+        "${DOCKER_REAL}" "$@"
+    else
+        command docker "$@"
+    fi
+}
 
 BACKUP_DIR="${BACKUP_DIR:-/home/vast/minecraft/backups}"
 RETAIN_DAYS="${BACKUP_RETENTION_DAYS:-7}"
@@ -18,12 +27,15 @@ ARCHIVE_NAME="minecraft-${TIMESTAMP}.tar.gz"
 
 mkdir -p "$BACKUP_DIR"
 
-env_file=/home/vast/minecraft/.env
+env_file="${CREEPWATCH_ENV_FILE:-/home/vast/minecraft/.env}"
 if [ -f "$env_file" ]; then
     # Compose-style .env values may contain spaces, so don't `source` them.
-    # Pluck the two keys we need with a literal grep.
-    TELEGRAM_BOT_TOKEN=$(grep -m1 '^TELEGRAM_BOT_TOKEN=' "$env_file" | cut -d= -f2-)
-    ADMIN_CHAT_IDS=$(grep -m1 '^ADMIN_CHAT_IDS=' "$env_file" | cut -d= -f2-)
+    if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+        TELEGRAM_BOT_TOKEN=$(grep -m1 '^TELEGRAM_BOT_TOKEN=' "$env_file" | cut -d= -f2-)
+    fi
+    if [ -z "${ADMIN_CHAT_IDS:-}" ]; then
+        ADMIN_CHAT_IDS=$(grep -m1 '^ADMIN_CHAT_IDS=' "$env_file" | cut -d= -f2-)
+    fi
     export TELEGRAM_BOT_TOKEN ADMIN_CHAT_IDS
 fi
 
@@ -45,14 +57,14 @@ notify_failure() {
 }
 
 log "save-all flush"
-if ! docker exec minecraft rcon-cli save-all flush >/dev/null 2>&1; then
+if ! docker_cli exec minecraft rcon-cli save-all flush >/dev/null 2>&1; then
     log "FAIL: save-all flush"
     notify_failure "🚨 Minecraft backup failed at save-all flush. Backup not created."
     exit 1
 fi
 
 log "save-off"
-if ! docker exec minecraft rcon-cli save-off >/dev/null 2>&1; then
+if ! docker_cli exec minecraft rcon-cli save-off >/dev/null 2>&1; then
     log "FAIL: save-off"
     notify_failure "🚨 Minecraft backup failed at save-off. Backup not created."
     exit 1
@@ -60,7 +72,7 @@ fi
 
 log "snapshotting volume to $ARCHIVE_NAME"
 backup_ok=1
-if ! docker run --rm \
+if ! docker_cli run --rm \
         -v minecraft_data:/data:ro \
         -v "$BACKUP_DIR":/backups \
         alpine:latest \
@@ -70,7 +82,7 @@ if ! docker run --rm \
 fi
 
 log "save-on"
-docker exec minecraft rcon-cli save-on >/dev/null 2>&1 || log "WARN: save-on returned non-zero"
+docker_cli exec minecraft rcon-cli save-on >/dev/null 2>&1 || log "WARN: save-on returned non-zero"
 
 if [ "$backup_ok" -ne 1 ]; then
     notify_failure "🚨 Minecraft backup tar failed. Server autosave re-enabled. Investigate /var/log/minecraft-backup.log or journalctl -u minecraft-backup."

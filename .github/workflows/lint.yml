@@ -32,7 +32,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y shellcheck
-          shellcheck scripts/pre-update-check.sh scripts/backup.sh \
+          shellcheck scripts/pre-update-check.sh scripts/backup.sh scripts/restore.sh \
             bin/safe-deploy.sh bin/docker-mc-guard.sh \
             scripts/check-creepwatch-heartbeat.sh scripts/deploy-mc-guard.sh
 

@@ -49,6 +49,18 @@ validate_compose() {
         [ "$d" = 1 ] && [ "$nd" = 1 ] && [ "$mc" = 1 ] || return 1
         return 0
         ;;
+      stop)
+        shift
+        [ "$#" -eq 1 ] || return 1
+        [ "$1" = minecraft ] || return 1
+        return 0
+        ;;
+      start)
+        shift
+        [ "$#" -eq 1 ] || return 1
+        [ "$1" = minecraft ] || return 1
+        return 0
+        ;;
       *) return 1 ;;
     esac
   done
