@@ -319,11 +319,24 @@ backup notification path (email/SMS from the provider) independent of Telegram.
 3. Tar the `minecraft_data` volume from an ephemeral `alpine:latest` container (`docker run` uses **`DOCKER_REAL`** when set, as in mc-guard).
 4. `rcon save-on` — resume autosave (always runs, even if the snapshot fails).
 
-**`BACKUP_DIR`** defaults to `/home/vast/minecraft/backups` for bare-host cron; mc-guard sets **`BACKUP_DIR=/backups`** (from **`CREEPWATCH_BACKUP_DIR`**, default **`/backups`**) so files land in the repo’s **`./backups`** on the host. Old archives are pruned after **7 days** (**`BACKUP_RETENTION_DAYS`**). Failures are reported to Telegram when **`TELEGRAM_BOT_TOKEN`** / **`ADMIN_CHAT_IDS`** are in the environment or found via **`CREEPWATCH_ENV_FILE`** (or the legacy default `.env` path).
+**`BACKUP_DIR`** defaults to `/home/vast/minecraft/backups` for bare-host cron; mc-guard sets **`BACKUP_DIR=/backups`** (from **`CREEPWATCH_BACKUP_DIR`**, default **`/backups`**) so files land in the repo’s **`./backups`** on the host. Local pruning is either **`BACKUP_MAX_ARCHIVES`** (keep newest *N* tarballs) or, if that is unset, **`BACKUP_RETENTION_DAYS`** (default **7**). Failures are reported to Telegram when **`TELEGRAM_BOT_TOKEN`** / **`ADMIN_CHAT_IDS`** are in the environment or found via **`CREEPWATCH_ENV_FILE`** (or the legacy default `.env` path).
+
+### Cloudflare R2 (optional)
+
+After a successful local tarball, **`scripts/backup.sh`** can upload to **R2** with the **AWS S3 API** (via the official **`amazon/aws-cli`** image and **`docker run`**, same as the rest of the script). Set on the host **`.env`** (and pass through Compose to **`mc-guard`** — already wired in `docker-compose.yml`):
+
+| Variable | Purpose |
+|----------|---------|
+| **`R2_S3_ENDPOINT`** | `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` (Dashboard → R2 → S3 API) |
+| **`R2_BUCKET`** | Bucket name |
+| **`R2_ACCESS_KEY_ID`** / **`R2_SECRET_ACCESS_KEY`** | R2 **S3 API** access key pair (create a token limited to this bucket) |
+| **`R2_PREFIX`** | Optional object prefix (default **`minecraft/`** if unset) |
+| **`R2_RETAIN_COUNT`** | Max objects to keep under that prefix (default **3**) |
+| **`BACKUP_MAX_ARCHIVES`** | Optional: keep only this many **local** tarballs (e.g. **3**) so disk use stays small |
+
+If R2 env is only **partly** set, the script logs a warning and skips R2. If upload fails after a good local backup, the script **exits 1** and Telegram gets a failure line. Use a **bucket-scoped** API token so a compromised server cannot touch the rest of your Cloudflare account.
 
 Optional systemd units ship under `systemd/` — see **`minecraft-backup.service`** and **`minecraft-backup.timer`**.
-
-Push backups off-host (S3, Backblaze, rsync to another box, …) by extending the script after the successful snapshot step.
 
 ## Repository layout
 
