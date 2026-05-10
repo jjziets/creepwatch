@@ -94,6 +94,7 @@ jobs:
             set -eux
             cd "$DEPLOY_PATH"
             test -f docker-compose.yml
+            test -d .git || { echo "ERROR: DEPLOY_PATH must be a git clone of this repo (missing .git). Clone or fix the DEPLOY_PATH secret." >&2; exit 1; }
             git fetch origin main
             git checkout main
             git pull --ff-only origin main
