@@ -29,6 +29,7 @@ in the same Compose stack.
 - **Log-tail resilience** — mc-guard reconnects to `docker logs` after a Minecraft container restart instead of exiting.
 - **Skip escalation** — Watchtower skip streak is persisted; long runs of “players always online” escalate the wording of the heads-up message.
 - **Heartbeat file** — mc-guard refreshes `/data/.creepwatch_heartbeat` for host-side stale detection.
+- **Restricted Docker CLI** — inside `mc-guard`, `docker` is a wrapper that only allows `exec minecraft rcon-cli`, `logs … minecraft`, and `compose … pull|up` for the `minecraft` service (see `bin/docker-mc-guard.sh`).
 
 ## Commands
 
@@ -50,10 +51,11 @@ Long form and short alias both work.
 
 ## Security
 
-- **Admins only in private chat** — The bot ignores every update except private DMs where the sender’s Telegram **user id** is listed in `ADMIN_CHAT_IDS`. Commands, the Minecraft chat bridge, and Allow / Deny buttons are not accepted from groups, channels, or strangers (including no reply to random `/start` spam).
+- **Admins only in private chat** — The bot ignores every update except private DMs where the sender’s Telegram **user id** is listed in `ADMIN_CHAT_IDS`. Commands, the Minecraft chat bridge, and Allow / Deny buttons are not accepted from groups, channels, or strangers (including no reply to random `/start` spam). In BotFather, leave **Allow groups** off so the bot cannot be added to chats you do not control.
 - **Configure user ids, not groups** — Use the positive id from [@userinfobot](https://t.me/userinfobot) in a **private** chat with yourself. Negative ids are groups/supergroups; the bot refuses them at startup.
-- **Secrets** — `TELEGRAM_BOT_TOKEN` and the Docker socket give full power over the host stack; treat `.env` like production credentials and rotate the bot token if it leaks.
-- **Attack surface** — RCON, `docker exec`, and compose-based `/update` are as trusted as anyone who can reach this bot or shell on the host.
+- **Docker from mc-guard** — Compose mounts `bin/docker-mc-guard.sh` as `/usr/local/bin/docker` ahead of the real binary (`docker.real`). Only **`docker exec minecraft rcon-cli`**, **`docker logs` … `minecraft` (name last)**, and **`docker compose` … `pull minecraft` / `up -d --no-deps minecraft`** reach the host Docker CLI. RCON stays local to the host via that single `exec` path. The **Docker socket** is still high-trust: malicious code inside the container could talk to it directly without the `docker` binary—keep the image and `mc_guard.py` supply chain trusted.
+- **Secrets** — Treat `TELEGRAM_BOT_TOKEN` and host `.env` like production credentials; rotate the bot token if it leaks.
+- **Attack surface** — Anyone who can Telegram as an admin or SSH the host can trigger the same RCON/compose paths the bot uses.
 
 ## Quick start
 
@@ -72,10 +74,9 @@ Long form and short alias both work.
    ```
 5. Message your bot `/help` from each admin account.
 
-The bot needs the Docker socket and `docker` binary mounted because it tails the
-`minecraft` container's logs and calls `rcon-cli` inside it. That's how it
-detects whitelist rejections, joins, leaves, chat, and `ERROR` lines, and how it
-manages the whitelist and the admin chat bridge.
+The bot needs the Docker socket and a **restricted** `docker` entrypoint (see
+`bin/docker-mc-guard.sh`) so it can tail the `minecraft` container's logs and run
+`rcon-cli` inside that container only.
 
 ## How it works
 
@@ -296,6 +297,7 @@ docker-compose.yml
 mc_guard.py
 bin/
   safe-deploy.sh
+  docker-mc-guard.sh
 scripts/
   pre-update-check.sh
   backup.sh
