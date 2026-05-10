@@ -6,6 +6,12 @@
 # autosave. Players are not kicked. The save-on step is unconditional so we
 # never leave the world frozen, even if the snapshot fails.
 #
+# Progress: writes structured events to BACKUP_PROGRESS_FILE (TSV lines:
+# `PROGRESS\tstep\tstatus\tlabel\tdetail`) so mc-guard can edit a single
+# Telegram message instead of spamming one line per stage. Also appends a
+# human log line to BACKUP_LOG_FILE (default /data/logs/backup.log) so we
+# can post-mortem failures from past runs.
+#
 # Failures are reported to Telegram when TELEGRAM_BOT_TOKEN and ADMIN_CHAT_IDS
 # are set (Compose env) or plucked from CREEPWATCH_ENV_FILE (host cron) or the
 # legacy default path. Every failure is also written to stderr for cron/journald.
@@ -22,9 +28,6 @@
 # objects so at most R2_RETAIN_COUNT archives remain (default 3).
 # Optional BACKUP_MAX_ARCHIVES: keep only that many newest local tarballs (else
 # prune by BACKUP_RETENTION_DAYS, default 7).
-#
-# Optional BACKUP_PROGRESS_CHAT_ID: Telegram chat id (digits only) to receive
-# short stage updates; set by mc-guard when an admin runs /backup (not from .env pluck).
 #
 # BACKUP_DOCKER_HOST_DIR: host path for docker run -v bind mounts. mc-guard sets this
 # when BACKUP_DIR is a container path (/backups); the Docker daemon resolves -v on the host.
@@ -71,11 +74,89 @@ if [ -f "$env_file" ]; then
     [ -z "${BACKUP_STRICT_GZIP_TEST:-}" ] && BACKUP_STRICT_GZIP_TEST=$(pluck BACKUP_STRICT_GZIP_TEST)
     [ -z "${BACKUP_GZIP_TOOLS_IMAGE:-}" ] && BACKUP_GZIP_TOOLS_IMAGE=$(pluck BACKUP_GZIP_TOOLS_IMAGE)
     [ -z "${BACKUP_DOCKER_HOST_DIR:-}" ] && BACKUP_DOCKER_HOST_DIR=$(pluck BACKUP_DOCKER_HOST_DIR)
+    [ -z "${BACKUP_LOG_DIR:-}" ] && BACKUP_LOG_DIR=$(pluck BACKUP_LOG_DIR)
     export R2_BUCKET R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_S3_ENDPOINT R2_PREFIX R2_RETAIN_COUNT BACKUP_MAX_ARCHIVES
-    export BACKUP_SKIP_PREFLIGHT BACKUP_MIN_FREE_MB BACKUP_MIN_ARCHIVE_BYTES BACKUP_STRICT_GZIP_TEST BACKUP_GZIP_TOOLS_IMAGE BACKUP_DOCKER_HOST_DIR
+    export BACKUP_SKIP_PREFLIGHT BACKUP_MIN_FREE_MB BACKUP_MIN_ARCHIVE_BYTES BACKUP_STRICT_GZIP_TEST BACKUP_GZIP_TOOLS_IMAGE BACKUP_DOCKER_HOST_DIR BACKUP_LOG_DIR
 fi
 
-log() { printf '[%s backup] %s\n' "$(date -u +%FT%TZ)" "$*"; }
+# --- Persistent log: keep recent runs across container restarts so the
+# /logs command in mc-guard can show history. /data is bind-mounted from the
+# host; falls back to /tmp for host invocations (cron / systemd timer).
+BACKUP_LOG_DIR="${BACKUP_LOG_DIR:-/data/logs}"
+if ! mkdir -p "$BACKUP_LOG_DIR" 2>/dev/null; then
+    BACKUP_LOG_DIR="/tmp/creepwatch-logs"
+    mkdir -p "$BACKUP_LOG_DIR" 2>/dev/null || true
+fi
+BACKUP_LOG_FILE="${BACKUP_LOG_FILE:-$BACKUP_LOG_DIR/backup.log}"
+
+log() {
+    line=$(printf '[%s backup %s] %s' "$(date -u +%FT%TZ)" "$TIMESTAMP" "$*")
+    printf '%s\n' "$line"
+    printf '%s\n' "$line" >> "$BACKUP_LOG_FILE" 2>/dev/null || true
+}
+
+# ── Slot-set retention helpers ─────────────────────────────────────────────────
+# Slot 2/3 are anchored 24h apart so frequent same-day /backup runs only
+# refresh slot 1. Retention deletes any archive NOT in this slot set so the
+# server (and R2) cannot fill up with redundant near-real-time snapshots.
+
+# stdin: newest-first basenames (one per line). Args: max_slots gap_seconds.
+# stdout: subset forming a 24h-gap restore ladder.
+slot_archives_24h_gap() {
+    sa_max=${1:-3}
+    sa_gap=${2:-86400}
+    sa_last=0
+    sa_n=0
+    while IFS= read -r sa_bn; do
+        [ -z "$sa_bn" ] && continue
+        sa_ts=$(_archive_basename_to_epoch "$sa_bn") || continue
+        if [ "$sa_last" -eq 0 ]; then
+            printf '%s\n' "$sa_bn"
+            sa_last=$sa_ts
+            sa_n=$((sa_n + 1))
+            [ "$sa_n" -ge "$sa_max" ] && break
+        else
+            sa_diff=$((sa_last - sa_ts))
+            if [ "$sa_diff" -ge "$sa_gap" ]; then
+                printf '%s\n' "$sa_bn"
+                sa_last=$sa_ts
+                sa_n=$((sa_n + 1))
+                [ "$sa_n" -ge "$sa_max" ] && break
+            fi
+        fi
+    done
+}
+
+_archive_basename_to_epoch() {
+    abe_bn=$1
+    abe_iso=$(printf '%s\n' "$abe_bn" | sed -n 's/^minecraft-\([0-9][0-9][0-9][0-9]\)\([0-9][0-9]\)\([0-9][0-9]\)T\([0-9][0-9]\)\([0-9][0-9]\)\([0-9][0-9]\)Z\.tar\.gz$/\1-\2-\3T\4:\5:\6Z/p')
+    [ -z "$abe_iso" ] && return 1
+    date -u -d "$abe_iso" +%s 2>/dev/null
+}
+
+sha256_hex() {
+    # Hex SHA-256 of a file, empty on error. We compute this on the local
+    # tarball so R2 uploads carry it as user metadata, letting restore.sh
+    # decide whether to use the local copy or re-pull from R2.
+    sh_path=$1
+    [ -f "$sh_path" ] || return 0
+    sha256sum "$sh_path" 2>/dev/null | awk '{print $1}'
+}
+
+# Emit a structured progress event so mc-guard can render a step board.
+# Args: <step> <status: running|ok|fail|skip> [label] [detail]
+# Label/detail must not contain tabs. mc-guard tails the file by offset.
+progress() {
+    p_step=${1:?progress: step required}
+    p_status=${2:?progress: status required}
+    p_label=${3:-}
+    p_detail=${4:-}
+    log "step=$p_step status=$p_status label=\"$p_label\" detail=\"$p_detail\""
+    [ -z "${BACKUP_PROGRESS_FILE:-}" ] && return 0
+    printf 'PROGRESS\t%s\t%s\t%s\t%s\n' \
+        "$p_step" "$p_status" "$p_label" "$p_detail" \
+        >> "$BACKUP_PROGRESS_FILE" 2>/dev/null || true
+}
 
 # GNU gzip (BusyBox gzip in alpine:latest does not support "gzip -l").
 BACKUP_GZIP_TOOLS_IMAGE="${BACKUP_GZIP_TOOLS_IMAGE:-debian:bookworm-slim}"
@@ -98,19 +179,6 @@ notify_failure() {
             --data-urlencode "text=$text" >/dev/null 2>&1 || true
     done
     IFS=$saved_ifs
-}
-
-# Single-chat progress (mc-guard sets BACKUP_PROGRESS_CHAT_ID for /backup).
-progress_ping() {
-    text=$1
-    [ -z "${BACKUP_PROGRESS_CHAT_ID:-}" ] && return 0
-    [ -z "${TELEGRAM_BOT_TOKEN:-}" ] && return 0
-    case "$BACKUP_PROGRESS_CHAT_ID" in *[!0-9]*) return 0 ;; esac
-    log "progress telegram: $text"
-    curl -s -m 8 -X POST \
-        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-        --data-urlencode "chat_id=$BACKUP_PROGRESS_CHAT_ID" \
-        --data-urlencode "text=$text" >/dev/null 2>&1 || true
 }
 
 # --- Preflight: do not touch save-off / tar if the host or volume looks bad -----
@@ -148,33 +216,38 @@ preflight_backup() {
     return 0
 }
 
+log "start: archive=$ARCHIVE_NAME backup_dir=$BACKUP_DIR host_dir=$BACKUP_DOCKER_HOST_DIR"
+
+progress 1 running "Preflight"
 if ! preflight_backup; then
+    progress 1 fail "Preflight" "container not running, missing level.dat, or low disk"
     notify_failure "🚨 Minecraft backup skipped — preflight failed (container not running, missing level.dat on volume, or low disk). No snapshot taken."
     exit 1
 fi
+progress 1 ok "Preflight"
 
-progress_ping "Starting backup task…"
-progress_ping "Preflight OK — flushing world to disk (save-all)…"
-
+progress 2 running "Save-all flush"
 log "save-all flush"
 if ! docker_cli exec minecraft rcon-cli save-all flush >/dev/null 2>&1; then
+    progress 2 fail "Save-all flush" "RCON failed"
     log "FAIL: save-all flush"
     notify_failure "🚨 Minecraft backup failed at save-all flush (RCON). Backup not created — check server logs."
     exit 1
 fi
+progress 2 ok "Save-all flush"
 
-progress_ping "Stopping writes to disk (save-off) — Minecraft keeps running (container not stopped)."
-
+progress 3 running "Save-off (pause writes)"
 log "save-off"
 if ! docker_cli exec minecraft rcon-cli save-off >/dev/null 2>&1; then
+    progress 3 fail "Save-off" "RCON failed"
     log "FAIL: save-off"
     notify_failure "🚨 Minecraft backup failed at save-off (RCON). Backup not created."
     docker_cli exec minecraft rcon-cli save-on >/dev/null 2>&1 || true
     exit 1
 fi
+progress 3 ok "Save-off (writes paused, server still up)"
 
-progress_ping "Compressing world into $ARCHIVE_NAME (may take several minutes)…"
-
+progress 4 running "Compress world" "$ARCHIVE_NAME"
 log "snapshotting volume to $ARCHIVE_NAME"
 backup_ok=1
 tar_err=$(mktemp)
@@ -190,6 +263,8 @@ if ! docker_cli run --rm \
 fi
 rm -f "$tar_err"
 
+# Always resume autosave, even if tar failed. Otherwise the world is frozen.
+progress 5 running "Save-on (resume writes)"
 log "save-on"
 saveon_ok=1
 if ! docker_cli exec minecraft rcon-cli save-on >/dev/null 2>&1; then
@@ -198,26 +273,39 @@ if ! docker_cli exec minecraft rcon-cli save-on >/dev/null 2>&1; then
 fi
 
 if [ "$backup_ok" -ne 1 ]; then
+    progress 4 fail "Compress world" "tar exited non-zero — see backup.log"
+    if [ "$saveon_ok" -eq 1 ]; then
+        progress 5 ok "Save-on (resume writes)"
+    else
+        progress 5 fail "Save-on" "RCON failed — autosave may still be off"
+    fi
     notify_failure "🚨 Minecraft backup tar failed. Check disk, volume, and docker logs. save-on was attempted."
     [ "$saveon_ok" -eq 1 ] || notify_failure "🚨 Minecraft backup: tar failed and save-on also failed — use console/RCON save-on if needed."
     exit 1
 fi
 
 if [ "$saveon_ok" -ne 1 ]; then
+    progress 4 ok "Compress world" "$ARCHIVE_NAME"
+    progress 5 fail "Save-on" "RCON failed — autosave may still be off"
     notify_failure "🚨 Minecraft backup: tarball OK on disk but save-on failed — autosave may still be off; fix via RCON save-on or restart."
     exit 1
 fi
-
-progress_ping "Restarting world writes (save-on) — server online."
+progress 5 ok "Save-on (resume writes)"
 
 archive_path="$BACKUP_DIR/$ARCHIVE_NAME"
 if ! [ -f "$archive_path" ]; then
+    progress 4 fail "Compress world" "archive missing at $archive_path (host bind path?)"
     log "FAIL: tarball missing at $archive_path after tar (check BACKUP_DOCKER_HOST_DIR=$BACKUP_DOCKER_HOST_DIR vs BACKUP_DIR=$BACKUP_DIR)"
     notify_failure "🚨 Minecraft backup failed: archive not visible at expected path after snapshot (docker host bind path misconfigured?)."
     exit 1
 fi
 archive_bytes=$(wc -c < "$archive_path" 2>/dev/null | tr -d ' ' || echo 0)
+size=$(du -h "$archive_path" 2>/dev/null | cut -f1)
+progress 4 ok "Compress world" "$ARCHIVE_NAME ($size)"
+
+progress 6 running "Verify archive"
 if ! [ "$archive_bytes" -ge "$BACKUP_MIN_ARCHIVE_BYTES" ] 2>/dev/null; then
+    progress 6 fail "Verify archive" "too small (${archive_bytes} bytes)"
     rm -f "$archive_path"
     notify_failure "🚨 Minecraft backup rejected: archive too small (${archive_bytes} bytes, min ${BACKUP_MIN_ARCHIVE_BYTES}) — possible corruption or empty world; file removed."
     exit 1
@@ -226,6 +314,7 @@ fi
 if [ -n "${BACKUP_STRICT_GZIP_TEST:-}" ]; then
     log "postflight: gzip -t full test on $ARCHIVE_NAME (BACKUP_STRICT_GZIP_TEST)"
     if ! docker_cli run --rm -v "$BACKUP_DOCKER_HOST_DIR":/backups:ro "$BACKUP_GZIP_TOOLS_IMAGE" gzip -t "/backups/$ARCHIVE_NAME" 2>/dev/null; then
+        progress 6 fail "Verify archive" "gzip -t failed (corrupt)"
         rm -f "$archive_path"
         notify_failure "🚨 Minecraft backup rejected: gzip -t failed (truncated or corrupt tarball); file removed."
         exit 1
@@ -233,16 +322,15 @@ if [ -n "${BACKUP_STRICT_GZIP_TEST:-}" ]; then
 else
     log "postflight: gzip header check on $ARCHIVE_NAME (set BACKUP_STRICT_GZIP_TEST=1 for full -t)"
     if ! docker_cli run --rm -v "$BACKUP_DOCKER_HOST_DIR":/backups:ro "$BACKUP_GZIP_TOOLS_IMAGE" gzip -l "/backups/$ARCHIVE_NAME" >/dev/null 2>&1; then
+        progress 6 fail "Verify archive" "gzip header unreadable"
         rm -f "$archive_path"
         notify_failure "🚨 Minecraft backup rejected: gzip header unreadable (truncated or not gzip); file removed."
         exit 1
     fi
 fi
+progress 6 ok "Verify archive" "gzip OK · $size"
 
-size=$(du -h "$archive_path" 2>/dev/null | cut -f1)
 log "backup complete ($size)"
-
-progress_ping "Local backup OK — $ARCHIVE_NAME ($size), gzip verified."
 
 # --- Optional Cloudflare R2 upload + remote retention -----------------------------
 r2_fully_configured() {
@@ -259,12 +347,24 @@ r2_object_key() {
     esac
 }
 
+progress 7 running "R2 upload"
+archive_sha=$(sha256_hex "$archive_path")
+if [ -n "$archive_sha" ]; then
+    log "sha256 $ARCHIVE_NAME = $archive_sha"
+fi
+
 if r2_fully_configured; then
     R2_PREFIX_NORM=${R2_PREFIX:-minecraft/}
     R2_KEEP=${R2_RETAIN_COUNT:-3}
     r2_key=$(r2_object_key "$R2_PREFIX_NORM" "$ARCHIVE_NAME")
     log "uploading to R2 s3://$R2_BUCKET/$r2_key"
-    progress_ping "Sending world archive to R2…"
+    # Pass the local SHA-256 as user metadata. restore.sh fetches this via
+    # head-object and skips a re-download when the local file matches.
+    r2_metadata_arg=""
+    if [ -n "$archive_sha" ]; then
+        r2_metadata_arg="--metadata sha256=$archive_sha"
+    fi
+    # shellcheck disable=SC2086 # $r2_metadata_arg is intentionally word-split.
     if ! docker_cli run --rm \
         -e "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
         -e "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
@@ -273,12 +373,14 @@ if r2_fully_configured; then
         amazon/aws-cli:latest \
         s3 cp "/backups/$ARCHIVE_NAME" "s3://${R2_BUCKET}/${r2_key}" \
         --endpoint-url "$R2_S3_ENDPOINT" \
-        --region auto >/dev/null 2>&1; then
+        --region auto \
+        $r2_metadata_arg >/dev/null 2>&1; then
+        progress 7 fail "R2 upload" "aws-cli s3 cp failed"
         log "FAIL: R2 upload"
         notify_failure "🚨 Minecraft backup: local tarball OK but R2 upload failed (check R2_* env and bucket policy)."
         exit 1
     fi
-    log "R2 upload ok; pruning remote (keep newest $R2_KEEP)"
+    log "R2 upload ok; computing slot set (24h gap × ${R2_KEEP})"
     if ! r2_ls=$(docker_cli run --rm \
         -e "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
         -e "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
@@ -290,10 +392,17 @@ if r2_fully_configured; then
         log "WARN: R2 list failed; remote prune skipped"
         r2_ls=""
     fi
-    printf '%s\n' "$r2_ls" | awk '$4 ~ /^minecraft-[0-9]{8}T[0-9]{6}Z\.tar\.gz$/ { print $4 }' | sort -r | tail -n "+$((R2_KEEP + 1))" | while IFS= read -r k; do
+    r2_basenames=$(printf '%s\n' "$r2_ls" | awk '$4 ~ /^minecraft-[0-9]{8}T[0-9]{6}Z\.tar\.gz$/ { print $4 }' | sort -r)
+    r2_slot_set=$(printf '%s\n' "$r2_basenames" | slot_archives_24h_gap "$R2_KEEP")
+    log "R2 slot set: $(printf '%s ' "$r2_slot_set")"
+    # Delete from R2 anything NOT in the slot set.
+    printf '%s\n' "$r2_basenames" | while IFS= read -r k; do
         [ -z "$k" ] && continue
+        if printf '%s\n' "$r2_slot_set" | grep -qFx "$k"; then
+            continue
+        fi
         r2_del=$(r2_object_key "$R2_PREFIX_NORM" "$k")
-        log "R2 delete s3://$R2_BUCKET/$r2_del"
+        log "R2 delete s3://$R2_BUCKET/$r2_del (outside slot set)"
         docker_cli run --rm \
             -e "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
             -e "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
@@ -303,27 +412,57 @@ if r2_fully_configured; then
             --endpoint-url "$R2_S3_ENDPOINT" \
             --region auto >/dev/null 2>&1 || log "WARN: R2 rm failed for $k"
     done
-    progress_ping "R2 upload and retention finished."
+    n_slots=$(printf '%s\n' "$r2_slot_set" | grep -c . 2>/dev/null || echo 0)
+    progress 7 ok "R2 upload" "s3://${R2_BUCKET}/${r2_key} · kept ${n_slots} slot(s)"
 else
+    r2_slot_set=""
     if [ -n "${R2_BUCKET:-}" ] || [ -n "${R2_ACCESS_KEY_ID:-}" ] || [ -n "${R2_SECRET_ACCESS_KEY:-}" ] || [ -n "${R2_S3_ENDPOINT:-}" ]; then
         log "WARN: R2 partly configured — need R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_S3_ENDPOINT; skipping R2"
+        progress 7 skip "R2 upload" "partly configured — skipped"
+    else
+        progress 7 skip "R2 upload" "not configured"
     fi
 fi
 
 # --- Local retention -------------------------------------------------------------
+# Default: local mirrors R2 when configured; otherwise apply the same
+# 24h-gap slot rule locally so same-day repeat /backup runs do not evict
+# day-1 / day-2 anchors. Override with BACKUP_MAX_ARCHIVES (count) for
+# operators who want a flat newest-N policy.
+progress 8 running "Local retention"
+local_basenames=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'minecraft-*.tar.gz' -printf '%f\n' 2>/dev/null | sort -r)
+
 if [ -n "${BACKUP_MAX_ARCHIVES:-}" ]; then
-    # shellcheck disable=SC2016
-    find "$BACKUP_DIR" -maxdepth 1 -type f -name 'minecraft-*.tar.gz' \
-        | sort -r \
-        | tail -n "+$((BACKUP_MAX_ARCHIVES + 1))" \
-        | while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            rm -f "$f" && log "pruned local $f"
-        done
-    log "local retention: newest $BACKUP_MAX_ARCHIVES archive(s)"
+    keep_set=$(printf '%s\n' "$local_basenames" | head -n "$BACKUP_MAX_ARCHIVES")
+    retention_label="kept newest ${BACKUP_MAX_ARCHIVES} (BACKUP_MAX_ARCHIVES)"
+elif [ -n "$r2_slot_set" ]; then
+    keep_set=$r2_slot_set
+    n_keep=$(printf '%s\n' "$keep_set" | grep -c . 2>/dev/null || echo 0)
+    retention_label="mirroring R2 (${n_keep} slot archive(s))"
 else
-    find "$BACKUP_DIR" -name 'minecraft-*.tar.gz' -mtime "+$RETAIN_DAYS" -delete 2>/dev/null || true
-    log "pruned local backups older than $RETAIN_DAYS days"
+    keep_set=$(printf '%s\n' "$local_basenames" | slot_archives_24h_gap "${BACKUP_SLOT_COUNT:-3}")
+    n_keep=$(printf '%s\n' "$keep_set" | grep -c . 2>/dev/null || echo 0)
+    retention_label="local slot set (${n_keep} archive(s), 24h gap × ${BACKUP_SLOT_COUNT:-3})"
 fi
 
-progress_ping "Backup done — server online. ($ARCHIVE_NAME, $size)"
+# Always keep the just-created archive even if e.g. a clock skew or a stale
+# R2 listing put it outside the slot set. Anything else not in keep_set
+# gets pruned.
+keep_set=$(printf '%s\n%s\n' "$keep_set" "$ARCHIVE_NAME" | awk 'NF && !seen[$0]++')
+printf '%s\n' "$local_basenames" | while IFS= read -r bn; do
+    [ -z "$bn" ] && continue
+    if printf '%s\n' "$keep_set" | grep -qFx "$bn"; then
+        continue
+    fi
+    rm -f "$BACKUP_DIR/$bn" && log "local prune: $bn (outside keep set)"
+done
+
+# Legacy mtime-based prune as a safety net for any archives that might
+# linger after a rule change; default 7 days. Disabled when explicitly set
+# to 0.
+if [ -z "${BACKUP_MAX_ARCHIVES:-}" ] && [ "$RETAIN_DAYS" -gt 0 ] 2>/dev/null; then
+    find "$BACKUP_DIR" -maxdepth 1 -type f -name 'minecraft-*.tar.gz' -mtime "+$RETAIN_DAYS" -delete 2>/dev/null || true
+fi
+
+progress 8 ok "Local retention" "$retention_label"
+log "done: archive=$ARCHIVE_NAME size=$size"

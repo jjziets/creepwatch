@@ -6,9 +6,15 @@ Minecraft Whitelist Guard Bot
 - Slash commands for server management
 - Only notifies on actual Minecraft version updates (not routine restarts)
 """
-import contextlib, subprocess, requests, time, re, logging, os, threading, pathlib, json, datetime
+import contextlib, subprocess, requests, time, re, logging, os, threading, pathlib, json, datetime, tempfile
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
+
+from progress_board import (
+    MIN_EDIT_INTERVAL_SEC,
+    ProgressBoard,
+    ProgressFileTail,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -218,15 +224,31 @@ def _log_telegram_response(op: str, r, exc=None):
         log.warning("%s Telegram API error HTTP=%s body=%s", op, r.status_code, data)
 
 
-def send(chat_id: int, text: str, keyboard=None):
+def send(chat_id: int, text: str, keyboard=None) -> int | None:
+    """Send a message; return its Telegram message_id on success or None.
+
+    The return value lets callers later editMessageText (e.g. for a streaming
+    backup/restore progress board) without a separate API round-trip.
+    """
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if keyboard:
         payload["reply_markup"] = keyboard
     try:
         r = requests.post(f"{API}/sendMessage", json=payload, timeout=10)
         _log_telegram_response("sendMessage", r)
+        try:
+            data = r.json()
+        except Exception:
+            return None
+        if data.get("ok"):
+            try:
+                return int(data["result"]["message_id"])
+            except (KeyError, TypeError, ValueError):
+                return None
+        return None
     except Exception as e:
         _log_telegram_response("sendMessage", None, e)
+        return None
 
 
 def send_chat_action(chat_id: int, action: str = "typing") -> None:
@@ -358,42 +380,25 @@ TOGGLE_KEYS = ("joins", "leaves", "approvals", "rejects", "restarts", "errors", 
 
 HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
 
-*Whitelist*
-/whitelist · /wl — list all whitelisted players
-/approve · /a `<player>` — add player to whitelist
-/remove · /rm `<player>` — remove player from whitelist
-/wlreload · /wlr — `whitelist reload` after editing `whitelist.json` on disk
+*Players*  /online · /activity · /status
+/kick `<p>` `[r]` · /msg `<p>` `<m>` · /ban `<p>` `[r]` · /pardon `<p>` · /banip `<t>` · /pardonip `<t>`
 
-*Blocked*
-/blocked · /bl — list denied players
-/unblock · /ub `<player>` — unblock a denied player
+*Whitelist & blocks*
+/whitelist · /approve `<p>` · /remove `<p>` · /wlreload · /blocked · /unblock `<p>`
 
-*Server*
-/online · /ol — who is online right now
-/activity · /ac — last 20 join/leave events
-/status · /st — server version and player count
-/kick · /k `<player>` [reason] — disconnect a player
-/msg · /tell `<player>` `<message>` — server message to one player (not global chat bridge)
-/ban · /bn `<player>` [reason] — ban name
-/banip · /bi `<target>` [reason] — ban IP or pattern (validated characters only)
-/pardon · /pd `<player>` — unban name
-/pardonip · /pdi `<target>` — unban IP pattern
-/time — query daytime, gametime, day — or set day, night, noon, midnight, or ticks
-/weather — clear, rain, thunder (optional duration in seconds)
-/difficulty · /diff — peaceful, easy, normal, hard
-/gamerule · /gr — query or set; value must be true, false, or digits only
-/update · /up — pull latest MC image and recreate container; use /update force to override online check (needs env CREEPWATCH_PROJECT_DIR + compose mount)
-/backup — snapshot world to tarball (scheduled if online); sendChatAction + stage pings in your chat
-/restore slots — show restore slots 1–3 (newest first) with UTC times from filenames
-/restore list | last | `1` | `2` | `3` | `<filename>` — list, restore newest, Nth newest, or one by name (scheduled if online)
+*World*
+/time · /weather · /difficulty · /gamerule
+/backup — snapshot world (live step board in your chat; queued if anyone is online)
+/restore slots — show slot 1–3 (24h gap rule)
+/restore last`|`1`|`2`|`3`|`<file>` — restore (always takes pre-restore safety snapshot first)
+/update `[force]` — pull latest MC image and recreate (auto pre-update backup)
 
-*Notifications*
-/settings · /se — toggle your join, leave, approval, reject, restart, error, chat alerts
+*Diagnostics*
+/logs `backup`|`restore` `[N]` — tail last N lines (max 50) of the script log
+/settings — toggle which events ping you (joins, leaves, errors, chat, …)
 
-*Chat bridge*
-Send any non-command message here and it appears in Minecraft as `[Admin]`.
-
-/help · /h — show this message"""
+Plain text in this DM relays to in-game chat as `[Admin]`.
+Common aliases: /bu /rs /up /lg /wl /a /rm /bl /ub /ol /ac /st /se /h"""
 
 
 def cmd_whitelist(chat_id: int):
@@ -764,11 +769,46 @@ def schedule_maintenance(kind: str, chat_id: int, admin_name: str, restore_spec:
     return True
 
 
+def discover_backup_host_dir() -> str | None:
+    """Inspect mc-guard's own container to find the host source of /backups.
+
+    Required because `docker run -v <src>:<dst>` in backup.sh / restore.sh
+    sends `<src>` to the host daemon, so it must be a host path even when
+    the script runs inside mc-guard. This avoids forcing every operator to
+    set CREEPWATCH_BACKUP_DIR_HOST or CREEPWATCH_PROJECT_DIR by hand: a
+    fresh deploy of mc-guard can self-discover from the bind mount the
+    operator already declared in docker-compose.yml.
+    """
+    real = os.environ.get("DOCKER_REAL", "/usr/bin/docker.real")
+    if not pathlib.Path(real).is_file():
+        return None
+    target = str(BACKUP_DIR)
+    fmt = (
+        '{{ range .Mounts }}{{ if eq .Destination "' + target + '" }}'
+        '{{ .Source }}{{ end }}{{ end }}'
+    )
+    try:
+        out = subprocess.run(
+            [real, "inspect", "mc-guard", "--format", fmt],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception as e:
+        log.warning("discover_backup_host_dir failed: %s", e)
+        return None
+    if out.returncode != 0:
+        return None
+    v = out.stdout.strip()
+    return v or None
+
+
 def backup_dir_host_for_docker_bind() -> str | None:
     """Host directory for docker run -v when backup/restore run inside mc-guard.
 
     The Docker socket is the host daemon; bind mount sources must be host paths.
-    In compose, ./backups is typically <project>/backups on the host.
+    Resolution order, first non-empty wins:
+      1. CREEPWATCH_BACKUP_DIR_HOST env (explicit operator override)
+      2. CREEPWATCH_PROJECT_DIR/backups (legacy contract)
+      3. docker inspect mc-guard .Mounts[/backups].Source (self-discovery)
     """
     raw = os.environ.get("CREEPWATCH_BACKUP_DIR_HOST", "").strip()
     if raw:
@@ -776,7 +816,7 @@ def backup_dir_host_for_docker_bind() -> str | None:
     p = compose_project_dir()
     if p:
         return str(pathlib.Path(p) / "backups")
-    return None
+    return discover_backup_host_dir()
 
 
 def _subprocess_env_for_backup_restore() -> dict:
@@ -791,10 +831,10 @@ def _subprocess_env_for_backup_restore() -> dict:
     return env
 
 
-def run_backup_subprocess(progress_chat_id: int | None = None) -> subprocess.CompletedProcess:
+def run_backup_subprocess(progress_file: str | None = None) -> subprocess.CompletedProcess:
     env = _subprocess_env_for_backup_restore()
-    if progress_chat_id is not None:
-        env["BACKUP_PROGRESS_CHAT_ID"] = str(int(progress_chat_id))
+    if progress_file:
+        env["BACKUP_PROGRESS_FILE"] = progress_file
     return subprocess.run(
         ["/bin/sh", str(BACKUP_SCRIPT)],
         env=env,
@@ -802,6 +842,62 @@ def run_backup_subprocess(progress_chat_id: int | None = None) -> subprocess.Com
         text=True,
         timeout=7200,
     )
+
+
+# Slot 2/3 must be at least this far back from the previous slot. Backups
+# taken in the same 24h window only ever populate slot 1, so frequent
+# same-day /backup runs cannot evict day-1 / day-2 restore points from the
+# slot ladder.
+SLOT_GAP_SECONDS = 24 * 3600
+SLOT_COUNT = 3
+
+
+def _archive_basename_to_utc(name: str) -> datetime.datetime | None:
+    m = re.fullmatch(r"minecraft-(\d{8})T(\d{6})Z\.tar\.gz", name)
+    if not m:
+        return None
+    try:
+        return datetime.datetime.strptime(
+            m.group(1) + m.group(2), "%Y%m%d%H%M%S"
+        ).replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+
+
+def pick_slot_archives(
+    names_newest_first: list[str],
+    gap_seconds: int = SLOT_GAP_SECONDS,
+    max_slots: int = SLOT_COUNT,
+) -> list[str]:
+    """Return up to `max_slots` basenames forming a 24h-gap restore ladder.
+
+    Slot 1 = newest archive overall.
+    Slot 2 = newest archive at least `gap_seconds` older than slot 1.
+    Slot 3 = newest archive at least `gap_seconds` older than slot 2.
+
+    Same-day repeats land on slot 1 only; older days stay anchored to
+    slots 2/3. Both backup retention (when slot mode is active) and
+    /restore selection share this function so the displayed slot list
+    matches the kept-on-disk set.
+    """
+    picks: list[str] = []
+    last_ts: datetime.datetime | None = None
+    for n in names_newest_first:
+        ts = _archive_basename_to_utc(n)
+        if ts is None:
+            continue
+        if last_ts is None:
+            picks.append(n)
+            last_ts = ts
+            if len(picks) >= max_slots:
+                break
+            continue
+        if (last_ts - ts).total_seconds() >= gap_seconds:
+            picks.append(n)
+            last_ts = ts
+            if len(picks) >= max_slots:
+                break
+    return picks
 
 
 def sorted_backup_basenames() -> list[str]:
@@ -819,22 +915,49 @@ def restore_spec_error(spec: str) -> str | None:
     s = spec.strip()
     sl = s.lower()
     names = sorted_backup_basenames()
+    slots = pick_slot_archives(names)
     if sl == "last":
-        return "No backups in the backup directory yet." if not names else None
+        return "No backups in the backup directory yet." if not slots else None
     if sl in ("1", "2", "3"):
         i = int(sl)
-        if len(names) < i:
-            return f"Slot {sl} is not available — only {len(names)} backup(s)."
+        if len(slots) < i:
+            return (
+                f"Slot {sl} is not available — only {len(slots)} slot(s) populated "
+                f"(slots 2/3 require ≥24h gap from the previous slot)."
+            )
         return None
     if BACKUP_ARCHIVE_RE.fullmatch(s):
         return None if (BACKUP_DIR / s).is_file() else f"File not found: `{md_escape(s)}`"
     return "Invalid restore target. Use `/restore slots`, `last`, `1`–`3`, or a full backup filename."
 
 
-def run_restore_subprocess(restore_arg: str, progress_chat_id: int | None = None) -> subprocess.CompletedProcess:
+def resolve_restore_slot(spec: str) -> str | None:
+    """Map `last`/`1`/`2`/`3` to the actual basename via the 24h-gap ladder.
+
+    Pass full filenames through unchanged. Returns None if the spec cannot
+    be resolved (caller has already validated via `restore_spec_error`, but
+    the timing window between validation and resolution can race a prune).
+    """
+    s = spec.strip()
+    sl = s.lower()
+    if BACKUP_ARCHIVE_RE.fullmatch(s):
+        return s
+    slots = pick_slot_archives(sorted_backup_basenames())
+    if not slots:
+        return None
+    if sl == "last":
+        return slots[0]
+    if sl in ("1", "2", "3"):
+        i = int(sl)
+        if i <= len(slots):
+            return slots[i - 1]
+    return None
+
+
+def run_restore_subprocess(restore_arg: str, progress_file: str | None = None) -> subprocess.CompletedProcess:
     env = _subprocess_env_for_backup_restore()
-    if progress_chat_id is not None:
-        env["RESTORE_PROGRESS_CHAT_ID"] = str(int(progress_chat_id))
+    if progress_file:
+        env["RESTORE_PROGRESS_FILE"] = progress_file
     return subprocess.run(
         ["/bin/sh", str(RESTORE_SCRIPT), restore_arg],
         env=env,
@@ -844,14 +967,107 @@ def run_restore_subprocess(restore_arg: str, progress_chat_id: int | None = None
     )
 
 
+# ── Progress board runner ─────────────────────────────────────────────────────
+
+def _run_task_with_progress_board(
+    kind: str,
+    chat_id: int | None,
+    runner,
+) -> tuple[subprocess.CompletedProcess, ProgressBoard | None]:
+    """Spawn a backup/restore subprocess while streaming a step board to chat_id.
+
+    `runner(progress_file: str | None) -> CompletedProcess` is the actual
+    subprocess invoker (run_backup_subprocess or run_restore_subprocess
+    wrapped to capture the restore spec). The split keeps script-specific
+    env wiring out of this function.
+
+    When chat_id is None (host/cron path), no board is rendered, no
+    progress file is created, and the subprocess output is unchanged.
+    """
+    if chat_id is None:
+        r = runner(None)
+        return r, None
+
+    board = ProgressBoard(kind)
+    initial_text = board.render()
+    msg_id = send(chat_id, initial_text)
+    if msg_id is None:
+        # Telegram unreachable / API error — fall back to silent run rather
+        # than spinning up a poller that can never publish updates.
+        log.warning("progress board: sendMessage failed; running %s without live board", kind)
+        r = runner(None)
+        return r, board
+
+    progress_path_obj = pathlib.Path(tempfile.mkdtemp(prefix=f"creepwatch-{kind}-")) / "progress.log"
+    # Touch the file so the tail poller's first read sees an empty file
+    # rather than FileNotFoundError until the script's first append.
+    progress_path_obj.write_text("", encoding="utf-8")
+    tail = ProgressFileTail(progress_path_obj, board)
+
+    stop = threading.Event()
+
+    def edit_board() -> None:
+        edit(chat_id, msg_id, board.render())
+
+    def poll_loop() -> None:
+        last_edit = 0.0
+        last_text = initial_text
+        while not stop.is_set():
+            tail.poll()
+            now = time.monotonic()
+            text = board.render()
+            if text != last_text and (now - last_edit) >= MIN_EDIT_INTERVAL_SEC:
+                edit(chat_id, msg_id, text)
+                last_text = text
+                last_edit = now
+            if stop.wait(0.6):
+                break
+
+    th = threading.Thread(target=poll_loop, name=f"progress-{kind}", daemon=True)
+    th.start()
+
+    try:
+        r = runner(str(progress_path_obj))
+    finally:
+        stop.set()
+        th.join(timeout=5)
+
+    # Drain any events the script wrote after our last poll, then render the
+    # final state with the actual exit code.
+    tail.poll()
+    board.mark_done(r.returncode == 0)
+    try:
+        edit_board()
+    except Exception:
+        log.exception("final board edit")
+
+    try:
+        progress_path_obj.unlink(missing_ok=True)
+        progress_path_obj.parent.rmdir()
+    except Exception:
+        pass
+
+    return r, board
+
+
+def _format_failure_tail(r: subprocess.CompletedProcess) -> str:
+    """Render the last ~1.8KB of subprocess output as a Markdown code block."""
+    blob = ((r.stdout or "") + (r.stderr or "")).strip()
+    if not blob:
+        return "(no script output)"
+    return f"```\n{blob[-1800:]}\n```"
+
+
 def _cmd_backup_worker(chat_id: int, admin_name: str):
-    """Runs backup.sh with Telegram stage pings to chat_id; reports final outcome."""
+    """Runs backup.sh with a live step board in chat_id; broadcasts the final outcome."""
     try:
         send_chat_action(chat_id, BACKUP_TELEGRAM_CHAT_ACTION)
         with backup_typing_indicator(chat_id):
-            r = run_backup_subprocess(progress_chat_id=chat_id)
-        tail = ((r.stdout or "") + (r.stderr or "")).strip()
-        tail = md_escape(tail[-1800:]) if tail else "(no script output)"
+            r, _board = _run_task_with_progress_board(
+                kind="backup",
+                chat_id=chat_id,
+                runner=lambda pf: run_backup_subprocess(progress_file=pf),
+            )
         if r.returncode != 0:
             log.warning(
                 "backup.sh exit=%s admin=%s stderr_head=%r stdout_head=%r",
@@ -860,11 +1076,10 @@ def _cmd_backup_worker(chat_id: int, admin_name: str):
                 (r.stderr or "")[:800],
                 (r.stdout or "")[:400],
             )
-            broadcast(f"❌ *Backup failed* (exit {r.returncode})\n{tail}")
-            send(chat_id, f"❌ Backup finished with errors, exit {r.returncode}.\n{tail}")
+            broadcast(f"❌ *Backup failed* (exit {r.returncode}) — see /logs backup")
+            send(chat_id, f"❌ *Backup failed*, exit {r.returncode}.\n{_format_failure_tail(r)}")
             return
         broadcast("✅ *World backup* finished.")
-        send(chat_id, "✅ Backup finished successfully. See the stage messages above.")
     except Exception as e:
         log.exception("backup worker")
         err = md_escape(str(e)[:800])
@@ -873,13 +1088,15 @@ def _cmd_backup_worker(chat_id: int, admin_name: str):
 
 
 def _cmd_restore_worker(chat_id: int, admin_name: str, restore_spec: str):
-    """Runs restore.sh with Telegram stage pings to chat_id; reports final outcome."""
+    """Runs restore.sh with a live step board in chat_id; broadcasts the final outcome."""
     try:
         send_chat_action(chat_id, BACKUP_TELEGRAM_CHAT_ACTION)
         with backup_typing_indicator(chat_id):
-            r = run_restore_subprocess(restore_spec, progress_chat_id=chat_id)
-        tail = ((r.stdout or "") + (r.stderr or "")).strip()
-        tail = md_escape(tail[-1800:]) if tail else "(no script output)"
+            r, _board = _run_task_with_progress_board(
+                kind="restore",
+                chat_id=chat_id,
+                runner=lambda pf: run_restore_subprocess(restore_spec, progress_file=pf),
+            )
         if r.returncode != 0:
             log.warning(
                 "restore.sh exit=%s admin=%s spec=%r stderr_head=%r stdout_head=%r",
@@ -889,16 +1106,84 @@ def _cmd_restore_worker(chat_id: int, admin_name: str, restore_spec: str):
                 (r.stderr or "")[:800],
                 (r.stdout or "")[:400],
             )
-            broadcast(f"❌ *Restore failed* (exit {r.returncode})\n{tail}")
-            send(chat_id, f"❌ Restore failed.\n{tail}")
+            broadcast(f"❌ *Restore failed* (exit {r.returncode}) — see /logs restore")
+            send(chat_id, f"❌ *Restore failed*.\n{_format_failure_tail(r)}")
             return
         broadcast("✅ *World restore* finished — Minecraft was started again.")
-        send(chat_id, "✅ Restore finished. Watch logs for server ready.")
     except Exception as e:
         log.exception("restore worker")
         err = md_escape(str(e)[:800])
         broadcast(f"❌ *Restore crashed*: {err}")
         send(chat_id, f"❌ Restore crashed: {err}")
+
+
+# Persistent backup/restore log files written by the shell scripts. The
+# /logs command tails these so admins can post-mortem a failed run without
+# SSHing to the host.
+BACKUP_LOG_FILE = pathlib.Path(os.environ.get("BACKUP_LOG_FILE", "/data/logs/backup.log"))
+RESTORE_LOG_FILE = pathlib.Path(os.environ.get("RESTORE_LOG_FILE", "/data/logs/restore.log"))
+LOGS_MAX_LINES = 50
+LOGS_MAX_BYTES = 16_000
+
+
+def _tail_log_file(path: pathlib.Path, max_lines: int, max_bytes: int) -> list[str]:
+    """Return the last <=max_lines lines of a log file, never reading >max_bytes.
+
+    The byte cap matters because a single misbehaving run could leave a
+    multi-MB log and we don't want to OOM mc-guard just to print a tail.
+    """
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            start = max(0, size - max_bytes)
+            fh.seek(start)
+            raw = fh.read()
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        log.warning("tail log %s: %s", path, e)
+        return []
+    text = raw.decode(errors="replace")
+    # If we sliced mid-line, drop the first partial line.
+    if start > 0 and "\n" in text:
+        text = text.split("\n", 1)[1]
+    return text.splitlines()[-max_lines:]
+
+
+def cmd_logs(chat_id: int, arg: str):
+    """`/logs backup [N]` or `/logs restore [N]` — tail the script log file."""
+    parts = arg.split()
+    task = parts[0].lower() if parts else "backup"
+    if task in ("bu", "backup"):
+        path = BACKUP_LOG_FILE
+        label = "backup"
+    elif task in ("rs", "restore"):
+        path = RESTORE_LOG_FILE
+        label = "restore"
+    else:
+        send(chat_id, "Usage: `/logs backup [N]` · `/logs restore [N]` (N = last N lines, max 50)")
+        return
+    n_lines = LOGS_MAX_LINES
+    if len(parts) >= 2:
+        try:
+            n_lines = max(1, min(LOGS_MAX_LINES, int(parts[1])))
+        except ValueError:
+            send(chat_id, f"`{md_escape(parts[1])}` is not a number. Usage: `/logs {label} [N]`.")
+            return
+    if not path.is_file():
+        send(chat_id, f"📄 No `{md_escape(label)}.log` yet at `{md_escape(str(path))}`.")
+        return
+    lines = _tail_log_file(path, n_lines, LOGS_MAX_BYTES)
+    if not lines:
+        send(chat_id, f"📄 `{md_escape(label)}.log` is empty.")
+        return
+    # Telegram message limit is 4096 chars; leave headroom for the code fence.
+    body = "\n".join(lines)
+    if len(body) > 3800:
+        body = body[-3800:]
+        body = body.split("\n", 1)[1] if "\n" in body else body
+    send(chat_id, f"📄 *Last {len(lines)} lines* of `{md_escape(label)}.log`\n```\n{body}\n```")
 
 
 def cmd_backup(chat_id: int, admin_name: str):
@@ -915,12 +1200,6 @@ def cmd_backup(chat_id: int, admin_name: str):
         send(chat_id, "📌 *Backup scheduled* — players were messaged in-game; it runs when nobody is online.")
         return
     broadcast(f"📦 *World backup* started by {md_escape(admin_name)}…")
-    send(
-        chat_id,
-        "🕐 *Backup running* — you will get short lines here: starting task → save-off (writes paused, "
-        "server still up) → compressing world → save-on → R2 if configured → backup done. "
-        "Large worlds can take several minutes.",
-    )
     send_chat_action(chat_id, BACKUP_TELEGRAM_CHAT_ACTION)
     threading.Thread(target=_cmd_backup_worker, args=(chat_id, admin_name), daemon=True).start()
 
@@ -945,32 +1224,22 @@ def cmd_restore(chat_id: int, arg: str, admin_name: str):
 
     sub = parts[0]
     if sub.lower() == "slots":
-        env = _subprocess_env_for_backup_restore()
-        try:
-            r = subprocess.run(
-                ["/bin/sh", str(RESTORE_SCRIPT), "slots"],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-        except Exception as e:
-            send(chat_id, f"⚠️ Could not list slots: `{md_escape(str(e)[:400])}`")
-            return
-        out = (r.stdout or "").strip()
-        if r.returncode != 0:
-            err = (r.stderr or r.stdout or "unknown error").strip()
-            send(chat_id, f"⚠️ `/restore slots` failed: `{md_escape(err[:600])}`")
-            return
-        if not out:
-            send(chat_id, "📂 *Restore slots*\n(no output — is the backup directory empty?)")
-            return
-        body = "\n".join(md_escape(line) for line in out.splitlines())
+        slots = pick_slot_archives(sorted_backup_basenames())
+        lines = []
+        for i in range(1, SLOT_COUNT + 1):
+            tag = " (newest)" if i == 1 else ""
+            if i <= len(slots):
+                bn = slots[i - 1]
+                ts = _archive_basename_to_utc(bn)
+                ts_str = ts.strftime("%Y-%m-%d %H:%M:%S UTC") if ts else "(unparseable timestamp)"
+                lines.append(f"Slot {i}{tag}: `{md_escape(bn)}` — {md_escape(ts_str)}")
+            else:
+                lines.append(f"Slot {i}{tag}: (no backup ≥24h older than slot {i - 1 or 1})")
         send(
             chat_id,
-            "📂 *Restore slots* (`1` = newest, same as `/restore last`)\n"
-            f"{body}\n"
-            "Use `/restore 1` … `/restore 3` or `/restore last` to apply one.",
+            "📂 *Restore slots* (slots 2/3 require ≥24h gap)\n"
+            + "\n".join(lines)
+            + "\nUse `/restore 1`–`3`, `/restore last`, or `/restore <filename>`.",
         )
         return
 
@@ -1007,21 +1276,26 @@ def cmd_restore(chat_id: int, arg: str, admin_name: str):
         send(chat_id, md_escape(err))
         return
 
+    # Resolve the slot here so restore.sh always receives a concrete
+    # basename. That keeps slot logic in one place (mc-guard) and lets
+    # the queued/scheduled path remember the exact archive even if a
+    # later /backup adds a newer one before the lobby empties.
+    resolved = resolve_restore_slot(restore_arg)
+    if resolved is None:
+        send(chat_id, f"⚠️ Could not resolve restore target `{md_escape(restore_arg)}` — try `/restore slots`.")
+        return
+    restore_arg = resolved
+
     if players_online():
         if not schedule_maintenance("restore", chat_id, admin_name, restore_arg):
             send(chat_id, "⛔ Another backup or restore is already scheduled. Wait for the lobby to clear.")
             return
-        send(chat_id, "📌 *Restore scheduled* — players were messaged in-game; it runs when nobody is online.")
+        send(chat_id, f"📌 *Restore scheduled* (`{md_escape(restore_arg)}`) — players were messaged in-game; runs when nobody is online.")
         return
 
     broadcast(
         f"🔄 *World restore* (`{md_escape(restore_arg)}`) by {md_escape(admin_name)} — "
-        "progress messages will follow in your chat."
-    )
-    send(
-        chat_id,
-        "🕐 *Restore running* — stages: starting task → stop Minecraft → extract world → start Minecraft → done. "
-        "Extract can take several minutes.",
+        "live progress in their chat."
     )
     send_chat_action(chat_id, BACKUP_TELEGRAM_CHAT_ACTION)
     threading.Thread(
@@ -1056,9 +1330,11 @@ def maintenance_watcher_loop():
                 broadcast(f"📦 *Scheduled backup* (requested by {ae}) — lobby empty, running now…")
                 send_chat_action(req_chat, BACKUP_TELEGRAM_CHAT_ACTION)
                 with backup_typing_indicator(req_chat):
-                    r = run_backup_subprocess(progress_chat_id=req_chat)
-                tail = ((r.stdout or "") + (r.stderr or "")).strip()
-                tail = md_escape(tail[-1800:]) if tail else "(no script output)"
+                    r, _board = _run_task_with_progress_board(
+                        kind="backup",
+                        chat_id=req_chat,
+                        runner=lambda pf: run_backup_subprocess(progress_file=pf),
+                    )
                 if r.returncode != 0:
                     log.warning(
                         "scheduled backup.sh exit=%s stderr_head=%r stdout_head=%r",
@@ -1066,11 +1342,10 @@ def maintenance_watcher_loop():
                         (r.stderr or "")[:800],
                         (r.stdout or "")[:400],
                     )
-                    broadcast(f"❌ *Scheduled backup failed* (exit {r.returncode})\n{tail}")
-                    send(req_chat, f"❌ Scheduled backup failed.\n{tail}")
+                    broadcast(f"❌ *Scheduled backup failed* (exit {r.returncode}) — see /logs backup")
+                    send(req_chat, f"❌ Scheduled backup failed.\n{_format_failure_tail(r)}")
                 else:
                     broadcast("✅ *Scheduled backup* finished.")
-                    send(req_chat, "✅ Your scheduled backup finished successfully.")
             else:
                 spec = job.get("restore") or "last"
                 broadcast(
@@ -1078,15 +1353,16 @@ def maintenance_watcher_loop():
                 )
                 send_chat_action(req_chat, BACKUP_TELEGRAM_CHAT_ACTION)
                 with backup_typing_indicator(req_chat):
-                    r = run_restore_subprocess(spec, progress_chat_id=req_chat)
-                tail = ((r.stdout or "") + (r.stderr or "")).strip()
-                tail = md_escape(tail[-1800:]) if tail else "(no script output)"
+                    r, _board = _run_task_with_progress_board(
+                        kind="restore",
+                        chat_id=req_chat,
+                        runner=lambda pf: run_restore_subprocess(spec, progress_file=pf),
+                    )
                 if r.returncode != 0:
-                    broadcast(f"❌ *Scheduled restore failed* (exit {r.returncode})\n{tail}")
-                    send(req_chat, f"❌ Scheduled restore failed.\n{tail}")
+                    broadcast(f"❌ *Scheduled restore failed* (exit {r.returncode}) — see /logs restore")
+                    send(req_chat, f"❌ Scheduled restore failed.\n{_format_failure_tail(r)}")
                 else:
                     broadcast("✅ *Scheduled restore* finished — Minecraft was started again.")
-                    send(req_chat, "✅ Your scheduled restore finished. Watch logs for server ready.")
         except Exception:
             log.exception("maintenance_watcher_loop")
 
@@ -1225,6 +1501,7 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd in ("/settings", "/se"):         cmd_settings(chat_id)
     elif cmd in ("/backup", "/bu"):          cmd_backup(chat_id, sender_name)
     elif cmd in ("/restore", "/rs"):         cmd_restore(chat_id, arg, sender_name)
+    elif cmd in ("/logs", "/lg"):            cmd_logs(chat_id, arg)
     elif cmd in ("/update", "/up"):          cmd_update(chat_id, arg, sender_name)
     else:                                     send(chat_id, "Unknown command. Try /help")
 

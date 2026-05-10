@@ -75,6 +75,10 @@ services:
       - R2_PREFIX=${R2_PREFIX:-}
       - R2_RETAIN_COUNT=${R2_RETAIN_COUNT:-3}
       - BACKUP_MAX_ARCHIVES=${BACKUP_MAX_ARCHIVES:-}
+      # Slot count for the 24h-gap retention rule when R2 is not configured (default 3).
+      - BACKUP_SLOT_COUNT=${BACKUP_SLOT_COUNT:-3}
+      # How many pre-restore-<TS>.tar.gz safety snapshots restore.sh keeps (default 3).
+      - RESTORE_PRERESTORE_KEEP=${RESTORE_PRERESTORE_KEEP:-3}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # Restricted docker: exec minecraft rcon-cli, logs … minecraft,
