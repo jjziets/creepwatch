@@ -764,9 +764,27 @@ def schedule_maintenance(kind: str, chat_id: int, admin_name: str, restore_spec:
     return True
 
 
+def backup_dir_host_for_docker_bind() -> str | None:
+    """Host directory for docker run -v when backup/restore run inside mc-guard.
+
+    The Docker socket is the host daemon; bind mount sources must be host paths.
+    In compose, ./backups is typically <project>/backups on the host.
+    """
+    raw = os.environ.get("CREEPWATCH_BACKUP_DIR_HOST", "").strip()
+    if raw:
+        return raw
+    p = compose_project_dir()
+    if p:
+        return str(pathlib.Path(p) / "backups")
+    return None
+
+
 def _subprocess_env_for_backup_restore() -> dict:
     env = os.environ.copy()
     env["BACKUP_DIR"] = str(BACKUP_DIR)
+    host_b = backup_dir_host_for_docker_bind()
+    if host_b:
+        env["BACKUP_DOCKER_HOST_DIR"] = host_b
     project = compose_project_dir()
     if project:
         env["CREEPWATCH_PROJECT_DIR"] = project

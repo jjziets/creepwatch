@@ -25,6 +25,9 @@
 #
 # Optional BACKUP_PROGRESS_CHAT_ID: Telegram chat id (digits only) to receive
 # short stage updates; set by mc-guard when an admin runs /backup (not from .env pluck).
+#
+# BACKUP_DOCKER_HOST_DIR: host path for docker run -v bind mounts. mc-guard sets this
+# when BACKUP_DIR is a container path (/backups); the Docker daemon resolves -v on the host.
 
 set -u
 
@@ -67,14 +70,17 @@ if [ -f "$env_file" ]; then
     [ -z "${BACKUP_MIN_ARCHIVE_BYTES:-}" ] && BACKUP_MIN_ARCHIVE_BYTES=$(pluck BACKUP_MIN_ARCHIVE_BYTES)
     [ -z "${BACKUP_STRICT_GZIP_TEST:-}" ] && BACKUP_STRICT_GZIP_TEST=$(pluck BACKUP_STRICT_GZIP_TEST)
     [ -z "${BACKUP_GZIP_TOOLS_IMAGE:-}" ] && BACKUP_GZIP_TOOLS_IMAGE=$(pluck BACKUP_GZIP_TOOLS_IMAGE)
+    [ -z "${BACKUP_DOCKER_HOST_DIR:-}" ] && BACKUP_DOCKER_HOST_DIR=$(pluck BACKUP_DOCKER_HOST_DIR)
     export R2_BUCKET R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_S3_ENDPOINT R2_PREFIX R2_RETAIN_COUNT BACKUP_MAX_ARCHIVES
-    export BACKUP_SKIP_PREFLIGHT BACKUP_MIN_FREE_MB BACKUP_MIN_ARCHIVE_BYTES BACKUP_STRICT_GZIP_TEST BACKUP_GZIP_TOOLS_IMAGE
+    export BACKUP_SKIP_PREFLIGHT BACKUP_MIN_FREE_MB BACKUP_MIN_ARCHIVE_BYTES BACKUP_STRICT_GZIP_TEST BACKUP_GZIP_TOOLS_IMAGE BACKUP_DOCKER_HOST_DIR
 fi
 
 log() { printf '[%s backup] %s\n' "$(date -u +%FT%TZ)" "$*"; }
 
 # GNU gzip (BusyBox gzip in alpine:latest does not support "gzip -l").
 BACKUP_GZIP_TOOLS_IMAGE="${BACKUP_GZIP_TOOLS_IMAGE:-debian:bookworm-slim}"
+# docker run -v source path is always on the Docker host (see header).
+BACKUP_DOCKER_HOST_DIR="${BACKUP_DOCKER_HOST_DIR:-$BACKUP_DIR}"
 
 notify_failure() {
     text="$1"
@@ -174,7 +180,7 @@ backup_ok=1
 tar_err=$(mktemp)
 if ! docker_cli run --rm \
         -v minecraft_data:/data:ro \
-        -v "$BACKUP_DIR":/backups \
+        -v "$BACKUP_DOCKER_HOST_DIR":/backups \
         alpine:latest \
         tar czf "/backups/$ARCHIVE_NAME" -C /data . 2>"$tar_err"; then
     backup_ok=0
@@ -205,6 +211,11 @@ fi
 progress_ping "Restarting world writes (save-on) — server online."
 
 archive_path="$BACKUP_DIR/$ARCHIVE_NAME"
+if ! [ -f "$archive_path" ]; then
+    log "FAIL: tarball missing at $archive_path after tar (check BACKUP_DOCKER_HOST_DIR=$BACKUP_DOCKER_HOST_DIR vs BACKUP_DIR=$BACKUP_DIR)"
+    notify_failure "🚨 Minecraft backup failed: archive not visible at expected path after snapshot (docker host bind path misconfigured?)."
+    exit 1
+fi
 archive_bytes=$(wc -c < "$archive_path" 2>/dev/null | tr -d ' ' || echo 0)
 if ! [ "$archive_bytes" -ge "$BACKUP_MIN_ARCHIVE_BYTES" ] 2>/dev/null; then
     rm -f "$archive_path"
@@ -214,14 +225,14 @@ fi
 
 if [ -n "${BACKUP_STRICT_GZIP_TEST:-}" ]; then
     log "postflight: gzip -t full test on $ARCHIVE_NAME (BACKUP_STRICT_GZIP_TEST)"
-    if ! docker_cli run --rm -v "$BACKUP_DIR":/backups:ro "$BACKUP_GZIP_TOOLS_IMAGE" gzip -t "/backups/$ARCHIVE_NAME" 2>/dev/null; then
+    if ! docker_cli run --rm -v "$BACKUP_DOCKER_HOST_DIR":/backups:ro "$BACKUP_GZIP_TOOLS_IMAGE" gzip -t "/backups/$ARCHIVE_NAME" 2>/dev/null; then
         rm -f "$archive_path"
         notify_failure "🚨 Minecraft backup rejected: gzip -t failed (truncated or corrupt tarball); file removed."
         exit 1
     fi
 else
     log "postflight: gzip header check on $ARCHIVE_NAME (set BACKUP_STRICT_GZIP_TEST=1 for full -t)"
-    if ! docker_cli run --rm -v "$BACKUP_DIR":/backups:ro "$BACKUP_GZIP_TOOLS_IMAGE" gzip -l "/backups/$ARCHIVE_NAME" >/dev/null 2>&1; then
+    if ! docker_cli run --rm -v "$BACKUP_DOCKER_HOST_DIR":/backups:ro "$BACKUP_GZIP_TOOLS_IMAGE" gzip -l "/backups/$ARCHIVE_NAME" >/dev/null 2>&1; then
         rm -f "$archive_path"
         notify_failure "🚨 Minecraft backup rejected: gzip header unreadable (truncated or not gzip); file removed."
         exit 1
@@ -258,7 +269,7 @@ if r2_fully_configured; then
         -e "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
         -e "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
         -e "AWS_DEFAULT_REGION=auto" \
-        -v "$BACKUP_DIR":/backups:ro \
+        -v "$BACKUP_DOCKER_HOST_DIR":/backups:ro \
         amazon/aws-cli:latest \
         s3 cp "/backups/$ARCHIVE_NAME" "s3://${R2_BUCKET}/${r2_key}" \
         --endpoint-url "$R2_S3_ENDPOINT" \

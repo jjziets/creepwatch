@@ -9,6 +9,7 @@
 # Env: BACKUP_DIR (default /backups), CREEPWATCH_PROJECT_DIR (host compose dir),
 #      optional DOCKER_REAL for the real docker binary (same as backup.sh).
 # Optional RESTORE_PROGRESS_CHAT_ID + TELEGRAM_BOT_TOKEN for Telegram stage lines (mc-guard sets).
+# BACKUP_DOCKER_HOST_DIR: host path for docker run -v (mc-guard sets when BACKUP_DIR is /backups in-container).
 
 set -eu
 
@@ -21,6 +22,7 @@ docker_cli() {
 }
 
 BACKUP_DIR="${BACKUP_DIR:-/backups}"
+BACKUP_DOCKER_HOST_DIR="${BACKUP_DOCKER_HOST_DIR:-$BACKUP_DIR}"
 PROJECT="${CREEPWATCH_PROJECT_DIR:-}"
 
 log() { printf '[%s restore] %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -139,7 +141,7 @@ log "wiping volume and extracting"
 progress_ping "Clearing world volume and extracting backup (may take several minutes)…"
 if ! docker_cli run --rm \
   -v minecraft_data:/data \
-  -v "$BACKUP_DIR":/restore:ro \
+  -v "$BACKUP_DOCKER_HOST_DIR":/restore:ro \
   alpine:latest \
   sh -c "find /data -mindepth 1 -maxdepth 1 -exec rm -rf {} + && tar xzf \"/restore/$ARCHIVE_BN\" -C /data"; then
   log "FAIL: extract"

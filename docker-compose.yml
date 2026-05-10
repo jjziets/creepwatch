@@ -62,6 +62,8 @@ services:
       - TZ=${TZ:-UTC}
       # For /update: set to host deploy dir and mount that path read-only below.
       - CREEPWATCH_PROJECT_DIR=${CREEPWATCH_PROJECT_DIR:-}
+      # Host path for docker run backup/restore volume binds (defaults to PROJECT_DIR/backups in mc_guard).
+      - CREEPWATCH_BACKUP_DIR_HOST=${CREEPWATCH_BACKUP_DIR_HOST:-}
       - CREEPWATCH_HEARTBEAT_SEC=${CREEPWATCH_HEARTBEAT_SEC:-600}
       - CREEPWATCH_HEALTHCHECK_URL=${CREEPWATCH_HEALTHCHECK_URL:-}
       - CREEPWATCH_BACKUP_DIR=/backups
