@@ -12,7 +12,8 @@
 #
 # Preflight (before save-off): minecraft container running, world level.dat on
 # the volume, and enough free disk under BACKUP_DIR. Skips backup if unhealthy.
-# Post-tar: by default `gzip -l` (header read only — safe for huge worlds). Set
+# Post-tar: by default `gzip -l` (header read only — safe for huge worlds) using
+# BACKUP_GZIP_TOOLS_IMAGE (GNU gzip; Alpine BusyBox gzip has no -l). Set
 # BACKUP_STRICT_GZIP_TEST=1 to use `gzip -t` (reads entire archive; can OOM/timeout).
 #
 # Optional Cloudflare R2 (S3-compatible): set R2_BUCKET, R2_ACCESS_KEY_ID,
@@ -65,11 +66,15 @@ if [ -f "$env_file" ]; then
     [ -z "${BACKUP_MIN_FREE_MB:-}" ] && BACKUP_MIN_FREE_MB=$(pluck BACKUP_MIN_FREE_MB)
     [ -z "${BACKUP_MIN_ARCHIVE_BYTES:-}" ] && BACKUP_MIN_ARCHIVE_BYTES=$(pluck BACKUP_MIN_ARCHIVE_BYTES)
     [ -z "${BACKUP_STRICT_GZIP_TEST:-}" ] && BACKUP_STRICT_GZIP_TEST=$(pluck BACKUP_STRICT_GZIP_TEST)
+    [ -z "${BACKUP_GZIP_TOOLS_IMAGE:-}" ] && BACKUP_GZIP_TOOLS_IMAGE=$(pluck BACKUP_GZIP_TOOLS_IMAGE)
     export R2_BUCKET R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_S3_ENDPOINT R2_PREFIX R2_RETAIN_COUNT BACKUP_MAX_ARCHIVES
-    export BACKUP_SKIP_PREFLIGHT BACKUP_MIN_FREE_MB BACKUP_MIN_ARCHIVE_BYTES BACKUP_STRICT_GZIP_TEST
+    export BACKUP_SKIP_PREFLIGHT BACKUP_MIN_FREE_MB BACKUP_MIN_ARCHIVE_BYTES BACKUP_STRICT_GZIP_TEST BACKUP_GZIP_TOOLS_IMAGE
 fi
 
 log() { printf '[%s backup] %s\n' "$(date -u +%FT%TZ)" "$*"; }
+
+# GNU gzip (BusyBox gzip in alpine:latest does not support "gzip -l").
+BACKUP_GZIP_TOOLS_IMAGE="${BACKUP_GZIP_TOOLS_IMAGE:-debian:bookworm-slim}"
 
 notify_failure() {
     text="$1"
@@ -142,7 +147,8 @@ if ! preflight_backup; then
     exit 1
 fi
 
-progress_ping "📋 Preflight OK — flushing world (save-all)…"
+progress_ping "Starting backup task…"
+progress_ping "Preflight OK — flushing world to disk (save-all)…"
 
 log "save-all flush"
 if ! docker_cli exec minecraft rcon-cli save-all flush >/dev/null 2>&1; then
@@ -151,7 +157,7 @@ if ! docker_cli exec minecraft rcon-cli save-all flush >/dev/null 2>&1; then
     exit 1
 fi
 
-progress_ping "💾 save-all done — pausing autosave (save-off)…"
+progress_ping "Stopping writes to disk (save-off) — Minecraft keeps running (container not stopped)."
 
 log "save-off"
 if ! docker_cli exec minecraft rcon-cli save-off >/dev/null 2>&1; then
@@ -161,7 +167,7 @@ if ! docker_cli exec minecraft rcon-cli save-off >/dev/null 2>&1; then
     exit 1
 fi
 
-progress_ping "📸 Snapshotting volume → $ARCHIVE_NAME (may take several minutes)…"
+progress_ping "Compressing world into $ARCHIVE_NAME (may take several minutes)…"
 
 log "snapshotting volume to $ARCHIVE_NAME"
 backup_ok=1
@@ -196,6 +202,8 @@ if [ "$saveon_ok" -ne 1 ]; then
     exit 1
 fi
 
+progress_ping "Restarting world writes (save-on) — server online."
+
 archive_path="$BACKUP_DIR/$ARCHIVE_NAME"
 archive_bytes=$(wc -c < "$archive_path" 2>/dev/null | tr -d ' ' || echo 0)
 if ! [ "$archive_bytes" -ge "$BACKUP_MIN_ARCHIVE_BYTES" ] 2>/dev/null; then
@@ -206,14 +214,14 @@ fi
 
 if [ -n "${BACKUP_STRICT_GZIP_TEST:-}" ]; then
     log "postflight: gzip -t full test on $ARCHIVE_NAME (BACKUP_STRICT_GZIP_TEST)"
-    if ! docker_cli run --rm -v "$BACKUP_DIR":/backups:ro alpine:latest gzip -t "/backups/$ARCHIVE_NAME" 2>/dev/null; then
+    if ! docker_cli run --rm -v "$BACKUP_DIR":/backups:ro "$BACKUP_GZIP_TOOLS_IMAGE" gzip -t "/backups/$ARCHIVE_NAME" 2>/dev/null; then
         rm -f "$archive_path"
         notify_failure "🚨 Minecraft backup rejected: gzip -t failed (truncated or corrupt tarball); file removed."
         exit 1
     fi
 else
     log "postflight: gzip header check on $ARCHIVE_NAME (set BACKUP_STRICT_GZIP_TEST=1 for full -t)"
-    if ! docker_cli run --rm -v "$BACKUP_DIR":/backups:ro alpine:latest gzip -l "/backups/$ARCHIVE_NAME" >/dev/null 2>&1; then
+    if ! docker_cli run --rm -v "$BACKUP_DIR":/backups:ro "$BACKUP_GZIP_TOOLS_IMAGE" gzip -l "/backups/$ARCHIVE_NAME" >/dev/null 2>&1; then
         rm -f "$archive_path"
         notify_failure "🚨 Minecraft backup rejected: gzip header unreadable (truncated or not gzip); file removed."
         exit 1
@@ -223,7 +231,7 @@ fi
 size=$(du -h "$archive_path" 2>/dev/null | cut -f1)
 log "backup complete ($size)"
 
-progress_ping "✅ Local backup OK — $ARCHIVE_NAME ($size), gzip verified."
+progress_ping "Local backup OK — $ARCHIVE_NAME ($size), gzip verified."
 
 # --- Optional Cloudflare R2 upload + remote retention -----------------------------
 r2_fully_configured() {
@@ -245,7 +253,7 @@ if r2_fully_configured; then
     R2_KEEP=${R2_RETAIN_COUNT:-3}
     r2_key=$(r2_object_key "$R2_PREFIX_NORM" "$ARCHIVE_NAME")
     log "uploading to R2 s3://$R2_BUCKET/$r2_key"
-    progress_ping "☁️ Uploading to R2…"
+    progress_ping "Sending world archive to R2…"
     if ! docker_cli run --rm \
         -e "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
         -e "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
@@ -284,7 +292,7 @@ if r2_fully_configured; then
             --endpoint-url "$R2_S3_ENDPOINT" \
             --region auto >/dev/null 2>&1 || log "WARN: R2 rm failed for $k"
     done
-    progress_ping "☁️ R2 upload and retention finished."
+    progress_ping "R2 upload and retention finished."
 else
     if [ -n "${R2_BUCKET:-}" ] || [ -n "${R2_ACCESS_KEY_ID:-}" ] || [ -n "${R2_SECRET_ACCESS_KEY:-}" ] || [ -n "${R2_S3_ENDPOINT:-}" ]; then
         log "WARN: R2 partly configured — need R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_S3_ENDPOINT; skipping R2"
@@ -307,4 +315,4 @@ else
     log "pruned local backups older than $RETAIN_DAYS days"
 fi
 
-progress_ping "🏁 Backup pipeline finished — $ARCHIVE_NAME ($size)."
+progress_ping "Backup done — server online. ($ARCHIVE_NAME, $size)"

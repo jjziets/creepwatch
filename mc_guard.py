@@ -21,6 +21,8 @@ BACKUP_DIR = pathlib.Path(os.environ.get("CREEPWATCH_BACKUP_DIR", "/backups"))
 BACKUP_SCRIPT = pathlib.Path(os.environ.get("CREEPWATCH_BACKUP_SCRIPT", "/scripts/backup.sh"))
 RESTORE_SCRIPT = pathlib.Path(os.environ.get("CREEPWATCH_RESTORE_SCRIPT", "/scripts/restore.sh"))
 BACKUP_ARCHIVE_RE = re.compile(r"^minecraft-[0-9]{8}T[0-9]{6}Z\.tar\.gz$")
+# sendChatAction value while backup runs — "upload_document" is usually easier to spot than "typing" in bot DMs.
+BACKUP_TELEGRAM_CHAT_ACTION = "upload_document"
 
 _maintenance_lock = threading.Lock()
 _pending_maintenance: dict | None = None
@@ -228,11 +230,11 @@ def send(chat_id: int, text: str, keyboard=None):
 
 
 def send_chat_action(chat_id: int, action: str = "typing") -> None:
-    """Telegram 'typing…' (and other actions); typing expires after ~5s unless refreshed."""
+    """Telegram chat action (typing, upload_document, …); client shows it above the input, not as a message."""
     try:
         r = requests.post(
             f"{API}/sendChatAction",
-            json={"chat_id": chat_id, "action": action},
+            data={"chat_id": chat_id, "action": action},
             timeout=5,
         )
         _log_telegram_response("sendChatAction", r)
@@ -240,21 +242,25 @@ def send_chat_action(chat_id: int, action: str = "typing") -> None:
         _log_telegram_response("sendChatAction", None, e)
 
 
-def _typing_keepalive(chat_id: int, stop: threading.Event) -> None:
+def _chat_action_keepalive(chat_id: int, stop: threading.Event, action: str) -> None:
     while not stop.is_set():
-        send_chat_action(chat_id, "typing")
+        send_chat_action(chat_id, action)
         if stop.wait(4.0):
             break
 
 
 @contextlib.contextmanager
-def backup_typing_indicator(chat_id: int | None):
-    """Refresh typing indicator while a long backup runs (private admin chat only)."""
+def backup_typing_indicator(chat_id: int | None, action: str = None):
+    """Refresh sendChatAction while a long backup runs (private admin chat only)."""
+    if action is None:
+        action = BACKUP_TELEGRAM_CHAT_ACTION
     if chat_id is None:
         yield
         return
     stop = threading.Event()
-    th = threading.Thread(target=_typing_keepalive, args=(chat_id, stop), daemon=True)
+    th = threading.Thread(
+        target=_chat_action_keepalive, args=(chat_id, stop, action), daemon=True
+    )
     th.start()
     try:
         yield
@@ -377,8 +383,9 @@ HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
 /difficulty · /diff — peaceful, easy, normal, hard
 /gamerule · /gr — query or set; value must be true, false, or digits only
 /update · /up — pull latest MC image and recreate container; use /update force to override online check (needs env CREEPWATCH_PROJECT_DIR + compose mount)
-/backup — snapshot world to tarball (scheduled if online); typing indicator + stage pings in your chat
-/restore list | last | `<filename>` — list backups, restore latest, or restore one by name (scheduled if online)
+/backup — snapshot world to tarball (scheduled if online); sendChatAction + stage pings in your chat
+/restore slots — show restore slots 1–3 (newest first) with UTC times from filenames
+/restore list | last | `1` | `2` | `3` | `<filename>` — list, restore newest, Nth newest, or one by name (scheduled if online)
 
 *Notifications*
 /settings · /se — toggle your join, leave, approval, reject, restart, error, chat alerts
@@ -779,10 +786,40 @@ def run_backup_subprocess(progress_chat_id: int | None = None) -> subprocess.Com
     )
 
 
-def run_restore_subprocess(restore_arg: str) -> subprocess.CompletedProcess:
+def sorted_backup_basenames() -> list[str]:
+    """Newest-first minecraft-*.tar.gz basenames under BACKUP_DIR."""
+    if not BACKUP_DIR.is_dir():
+        return []
+    return sorted(
+        (p.name for p in BACKUP_DIR.iterdir() if p.is_file() and BACKUP_ARCHIVE_RE.fullmatch(p.name)),
+        reverse=True,
+    )
+
+
+def restore_spec_error(spec: str) -> str | None:
+    """None if spec is usable by restore.sh; else a short error for Telegram."""
+    s = spec.strip()
+    sl = s.lower()
+    names = sorted_backup_basenames()
+    if sl == "last":
+        return "No backups in the backup directory yet." if not names else None
+    if sl in ("1", "2", "3"):
+        i = int(sl)
+        if len(names) < i:
+            return f"Slot {sl} is not available — only {len(names)} backup(s)."
+        return None
+    if BACKUP_ARCHIVE_RE.fullmatch(s):
+        return None if (BACKUP_DIR / s).is_file() else f"File not found: `{md_escape(s)}`"
+    return "Invalid restore target. Use `/restore slots`, `last`, `1`–`3`, or a full backup filename."
+
+
+def run_restore_subprocess(restore_arg: str, progress_chat_id: int | None = None) -> subprocess.CompletedProcess:
+    env = _subprocess_env_for_backup_restore()
+    if progress_chat_id is not None:
+        env["RESTORE_PROGRESS_CHAT_ID"] = str(int(progress_chat_id))
     return subprocess.run(
         ["/bin/sh", str(RESTORE_SCRIPT), restore_arg],
-        env=_subprocess_env_for_backup_restore(),
+        env=env,
         capture_output=True,
         text=True,
         timeout=7200,
@@ -792,7 +829,7 @@ def run_restore_subprocess(restore_arg: str) -> subprocess.CompletedProcess:
 def _cmd_backup_worker(chat_id: int, admin_name: str):
     """Runs backup.sh with Telegram stage pings to chat_id; reports final outcome."""
     try:
-        send_chat_action(chat_id, "typing")
+        send_chat_action(chat_id, BACKUP_TELEGRAM_CHAT_ACTION)
         with backup_typing_indicator(chat_id):
             r = run_backup_subprocess(progress_chat_id=chat_id)
         tail = ((r.stdout or "") + (r.stderr or "")).strip()
@@ -817,6 +854,35 @@ def _cmd_backup_worker(chat_id: int, admin_name: str):
         send(chat_id, f"❌ Backup crashed: {err}")
 
 
+def _cmd_restore_worker(chat_id: int, admin_name: str, restore_spec: str):
+    """Runs restore.sh with Telegram stage pings to chat_id; reports final outcome."""
+    try:
+        send_chat_action(chat_id, BACKUP_TELEGRAM_CHAT_ACTION)
+        with backup_typing_indicator(chat_id):
+            r = run_restore_subprocess(restore_spec, progress_chat_id=chat_id)
+        tail = ((r.stdout or "") + (r.stderr or "")).strip()
+        tail = md_escape(tail[-1800:]) if tail else "(no script output)"
+        if r.returncode != 0:
+            log.warning(
+                "restore.sh exit=%s admin=%s spec=%r stderr_head=%r stdout_head=%r",
+                r.returncode,
+                admin_name,
+                restore_spec,
+                (r.stderr or "")[:800],
+                (r.stdout or "")[:400],
+            )
+            broadcast(f"❌ *Restore failed* (exit {r.returncode})\n{tail}")
+            send(chat_id, f"❌ Restore failed.\n{tail}")
+            return
+        broadcast("✅ *World restore* finished — Minecraft was started again.")
+        send(chat_id, "✅ Restore finished. Watch logs for server ready.")
+    except Exception as e:
+        log.exception("restore worker")
+        err = md_escape(str(e)[:800])
+        broadcast(f"❌ *Restore crashed*: {err}")
+        send(chat_id, f"❌ Restore crashed: {err}")
+
+
 def cmd_backup(chat_id: int, admin_name: str):
     if not BACKUP_SCRIPT.is_file():
         send(
@@ -833,16 +899,21 @@ def cmd_backup(chat_id: int, admin_name: str):
     broadcast(f"📦 *World backup* started by {md_escape(admin_name)}…")
     send(
         chat_id,
-        "🕐 *Backup running* — stage updates will appear here: preflight, snapshot, then R2 if configured. "
+        "🕐 *Backup running* — you will get short lines here: starting task → save-off (writes paused, "
+        "server still up) → compressing world → save-on → R2 if configured → backup done. "
         "Large worlds can take several minutes.",
     )
+    send_chat_action(chat_id, BACKUP_TELEGRAM_CHAT_ACTION)
     threading.Thread(target=_cmd_backup_worker, args=(chat_id, admin_name), daemon=True).start()
 
 
 def cmd_restore(chat_id: int, arg: str, admin_name: str):
     parts = arg.strip().split()
     if not parts:
-        send(chat_id, "Usage: `/restore list` · `/restore last` · `/restore <filename>`")
+        send(
+            chat_id,
+            "Usage: `/restore slots` · `/restore list` · `/restore last` · `/restore 1`–`3` · `/restore <filename>`",
+        )
         return
     if not RESTORE_SCRIPT.is_file():
         send(
@@ -850,36 +921,72 @@ def cmd_restore(chat_id: int, arg: str, admin_name: str):
             "⚠️ Restore script is not mounted. Add `./scripts:/scripts:ro` on mc-guard (see README).",
         )
         return
+    if not BACKUP_DIR.is_dir():
+        send(chat_id, f"⚠️ Backup directory missing: `{md_escape(str(BACKUP_DIR))}`")
+        return
+
+    sub = parts[0]
+    if sub.lower() == "slots":
+        env = _subprocess_env_for_backup_restore()
+        try:
+            r = subprocess.run(
+                ["/bin/sh", str(RESTORE_SCRIPT), "slots"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except Exception as e:
+            send(chat_id, f"⚠️ Could not list slots: `{md_escape(str(e)[:400])}`")
+            return
+        out = (r.stdout or "").strip()
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "unknown error").strip()
+            send(chat_id, f"⚠️ `/restore slots` failed: `{md_escape(err[:600])}`")
+            return
+        if not out:
+            send(chat_id, "📂 *Restore slots*\n(no output — is the backup directory empty?)")
+            return
+        body = "\n".join(md_escape(line) for line in out.splitlines())
+        send(
+            chat_id,
+            "📂 *Restore slots* (`1` = newest, same as `/restore last`)\n"
+            f"{body}\n"
+            "Use `/restore 1` … `/restore 3` or `/restore last` to apply one.",
+        )
+        return
+
     if not compose_project_dir():
         send(
             chat_id,
             "⚠️ Restore needs `CREEPWATCH_PROJECT_DIR` plus a read-only compose project mount (same as `/update`).",
         )
         return
-    if not BACKUP_DIR.is_dir():
-        send(chat_id, f"⚠️ Backup directory missing: `{md_escape(str(BACKUP_DIR))}`")
-        return
 
-    sub = parts[0]
     if sub.lower() == "list":
-        names = sorted(
-            (p.name for p in BACKUP_DIR.iterdir() if p.is_file() and BACKUP_ARCHIVE_RE.fullmatch(p.name)),
-            reverse=True,
-        )
+        names = sorted_backup_basenames()
         if not names:
             send(chat_id, "📂 No `minecraft-*.tar.gz` backups in the backup directory yet.")
             return
         body = "\n".join(f"`{md_escape(n)}`" for n in names[:25])
         more = "\n…" if len(names) > 25 else ""
-        send(chat_id, f"📂 *Backups* (newest first)\n{body}{more}")
+        send(
+            chat_id,
+            f"📂 *Backups* (newest first)\n{body}{more}\n"
+            "See `/restore slots` for slots `1`–`3` with UTC times.",
+        )
         return
 
-    restore_arg = "last" if sub.lower() == "last" else sub
-    if restore_arg != "last" and not BACKUP_ARCHIVE_RE.fullmatch(restore_arg):
-        send(chat_id, "Invalid backup name. Use `/restore list` or `/restore last`.")
-        return
-    if restore_arg != "last" and not (BACKUP_DIR / restore_arg).is_file():
-        send(chat_id, f"⚠️ File not found: `{md_escape(restore_arg)}`")
+    sl = sub.lower()
+    if sl == "last":
+        restore_arg = "last"
+    elif sl in ("1", "2", "3"):
+        restore_arg = sl
+    else:
+        restore_arg = sub
+    err = restore_spec_error(restore_arg)
+    if err:
+        send(chat_id, md_escape(err))
         return
 
     if players_online():
@@ -889,16 +996,21 @@ def cmd_restore(chat_id: int, arg: str, admin_name: str):
         send(chat_id, "📌 *Restore scheduled* — players were messaged in-game; it runs when nobody is online.")
         return
 
-    broadcast(f"🔄 *World restore* (`{md_escape(restore_arg)}`) by {md_escape(admin_name)} — stopping Minecraft…")
-    r = run_restore_subprocess(restore_arg)
-    tail = ((r.stdout or "") + (r.stderr or "")).strip()
-    tail = md_escape(tail[-1800:]) if tail else "(no script output)"
-    if r.returncode != 0:
-        broadcast(f"❌ *Restore failed* (exit {r.returncode})\n{tail}")
-        send(chat_id, f"❌ Restore failed.\n{tail}")
-        return
-    broadcast("✅ *World restore* finished — Minecraft was started again.")
-    send(chat_id, "✅ Restore finished. Watch logs for server ready.")
+    broadcast(
+        f"🔄 *World restore* (`{md_escape(restore_arg)}`) by {md_escape(admin_name)} — "
+        "progress messages will follow in your chat."
+    )
+    send(
+        chat_id,
+        "🕐 *Restore running* — stages: starting task → stop Minecraft → extract world → start Minecraft → done. "
+        "Extract can take several minutes.",
+    )
+    send_chat_action(chat_id, BACKUP_TELEGRAM_CHAT_ACTION)
+    threading.Thread(
+        target=_cmd_restore_worker,
+        args=(chat_id, admin_name, restore_arg),
+        daemon=True,
+    ).start()
 
 
 def maintenance_watcher_loop():
@@ -924,7 +1036,7 @@ def maintenance_watcher_loop():
             ae = md_escape(admin_label)
             if kind == "backup":
                 broadcast(f"📦 *Scheduled backup* (requested by {ae}) — lobby empty, running now…")
-                send_chat_action(req_chat, "typing")
+                send_chat_action(req_chat, BACKUP_TELEGRAM_CHAT_ACTION)
                 with backup_typing_indicator(req_chat):
                     r = run_backup_subprocess(progress_chat_id=req_chat)
                 tail = ((r.stdout or "") + (r.stderr or "")).strip()
@@ -944,9 +1056,11 @@ def maintenance_watcher_loop():
             else:
                 spec = job.get("restore") or "last"
                 broadcast(
-                    f"🔄 *Scheduled restore* (`{md_escape(spec)}`, by {ae}) — lobby empty, stopping Minecraft…"
+                    f"🔄 *Scheduled restore* (`{md_escape(spec)}`, by {ae}) — lobby empty; progress in requester's chat."
                 )
-                r = run_restore_subprocess(spec)
+                send_chat_action(req_chat, BACKUP_TELEGRAM_CHAT_ACTION)
+                with backup_typing_indicator(req_chat):
+                    r = run_restore_subprocess(spec, progress_chat_id=req_chat)
                 tail = ((r.stdout or "") + (r.stderr or "")).strip()
                 tail = md_escape(tail[-1800:]) if tail else "(no script output)"
                 if r.returncode != 0:
