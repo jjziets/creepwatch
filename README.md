@@ -5,6 +5,11 @@ tries to join, every admin gets a push with **Allow / Deny** buttons. One tap
 adds them to the whitelist (or blocks them) over RCON. Each admin tunes their
 own alerts via `/settings`.
 
+**Two-way chat:** authorised admins can talk to everyone in-game from Telegram
+(plain messages are relayed as gold `[Admin]` lines via `tellraw @a`). Player
+chat from the server logs is mirrored back to Telegram as `💬` lines for admins
+who enable **Chats** in `/settings`.
+
 Pairs with [`itzg/minecraft-server`](https://github.com/itzg/docker-minecraft-server)
 in the same Compose stack.
 
@@ -87,8 +92,40 @@ prefs.
 
 ## Chat bridge
 
-- **Telegram → Minecraft:** From an authorised admin chat, send any message that does **not** start with `/`. It is broadcast to all online players as `[Admin] FirstName: text` using `tellraw`.
-- **Minecraft → Telegram:** Lines matching in-game chat are formatted and sent to admins who have **Chats** enabled in `/settings`.
+The bot watches `docker logs` for vanilla-style chat lines (`]: <player> message`)
+and sends Telegram updates through the same notification pipeline as joins and
+errors. RCON runs `tellraw @a …` so bridged admin text appears for every player
+who can see action bar / chat output.
+
+### Telegram → Minecraft (admin → server)
+
+- Only chats listed in `ADMIN_CHAT_IDS` can send messages that reach the server.
+- **Text messages only** (Telegram updates with `text`). Stickers, photos, and
+  other payload types are ignored for bridging.
+- Anything that **starts with `/`** is treated as a bot command, not in-game
+  chat — use `/help`, `/online`, etc. as usual.
+- Plain text is normalised to a single line, trimmed to about **800 characters**,
+  then sent with `tellraw`: gold bold `[Admin]`, yellow admin first name (up to
+  ~40 chars of label), white message body.
+- If `rcon-cli` fails, you get a short **⚠️** reply in your Telegram chat with
+  the error text (Markdown-escaped where needed).
+
+### Minecraft → Telegram (server → admins)
+
+- Player chat is detected from log lines matching `]: <player> remainder`.
+- Admins who turned **Chats** *off* in `/settings` do not receive these mirrors;
+  everyone still gets mandatory prompts (e.g. whitelist Allow / Deny) as before.
+- Telegram messages use legacy Markdown. Player names and message bodies are
+  escaped so Markdown metacharacters in chat (underscore, asterisk, backtick,
+  square brackets) cannot break the message. Long lines are compacted and
+  capped for readability (~800 chars of content).
+
+### Quick checks
+
+1. From an admin account, run `/settings` and ensure **Chats** is on (green).
+2. Say something in-game — you should see `💬 *Player*: …` in Telegram.
+3. Reply in Telegram with a line that does **not** start with `/` — players
+   should see `[Admin] YourName: …` in Minecraft.
 
 ## Server log errors
 
