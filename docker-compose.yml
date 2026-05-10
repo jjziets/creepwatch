@@ -26,13 +26,14 @@ services:
       TZ: "${TZ:-UTC}"
       # Used only by /pre-update-check.sh to notify on skip
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
-      ADMIN_CHAT_IDS:    "${ADMIN_CHAT_IDS}"
+      ADMIN_CHAT_IDS: "${ADMIN_CHAT_IDS}"
     volumes:
       - minecraft_data:/data
       - ./scripts/pre-update-check.sh:/pre-update-check.sh:ro
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
-      - "com.centurylinklabs.watchtower.lifecycle.pre-update=sh /pre-update-check.sh"
+      - >-
+        com.centurylinklabs.watchtower.lifecycle.pre-update=sh /pre-update-check.sh
     networks:
       - minecraft_net
 
@@ -59,13 +60,26 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - ADMIN_CHAT_IDS=${ADMIN_CHAT_IDS}
       - TZ=${TZ:-UTC}
+      # For /update: set to host deploy dir and mount that path read-only below.
+      - CREEPWATCH_PROJECT_DIR=${CREEPWATCH_PROJECT_DIR:-}
+      - CREEPWATCH_HEARTBEAT_SEC=${CREEPWATCH_HEARTBEAT_SEC:-600}
+      - CREEPWATCH_HEALTHCHECK_URL=${CREEPWATCH_HEALTHCHECK_URL:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /usr/bin/docker:/usr/bin/docker
+      # Restricted docker CLI: only exec minecraft rcon-cli, logs … minecraft, compose pull/up minecraft.
+      - ./bin/docker-mc-guard.sh:/usr/local/bin/docker:ro
+      - /usr/bin/docker:/usr/bin/docker.real:ro
       - ./mc_guard.py:/app/mc_guard.py
       - ./data:/data
     # tzdata lets Python's ZoneInfo resolve named zones inside the slim image.
-    command: bash -c "pip install requests tzdata -q && python /app/mc_guard.py"
+    # PATH prefers /usr/local/bin so `docker` is the wrapper, not docker.real.
+    command:
+      - bash
+      - -c
+      - |
+        export PATH="/usr/local/bin:/usr/bin:/bin" DOCKER_REAL=/usr/bin/docker.real
+        pip install requests tzdata -q
+        python /app/mc_guard.py
     depends_on:
       - minecraft
     networks:

@@ -1,0 +1,14 @@
+[project]
+name = "creepwatch"
+version = "0.0.0"
+description = "Minecraft whitelist guard + Telegram"
+readme = "README.md"
+requires-python = ">=3.12"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"mc_guard.py" = ["E401", "E701", "I001", "E731", "E741", "UP017"]
+"test_*.py" = ["I001"]

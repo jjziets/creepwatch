@@ -21,10 +21,15 @@ in the same Compose stack.
 - **Join / leave alerts** — broadcast on player join and leave.
 - **Per-admin notification prefs** — `/settings` toggles joins, leaves, approvals, rejects, restarts, errors, and in-game **chat** mirrors independently for each admin.
 - **Chat bridge** — admins can send plain text in Telegram and it appears in-game as `[Admin] …` via `tellraw`. In-game `<player> chat` can be mirrored back to Telegram when **Chats** is on.
-- **Server admin commands** — manage whitelist, blocklist, online players, recent activity, server status.
+- **Server admin commands** — whitelist, blocklist, kick/ban/pardon, direct `msg` to one player, `whitelist reload`, time/weather/difficulty/gamerule, online/activity/status, optional `/update`.
 - **Update notifications** — broadcasts a message only when the Minecraft server version actually changes (silent on routine restarts).
 - **Log error paging** — `ERROR` lines are classified; known noisy patterns are suppressed; real issues go to Telegram with a cooldown per signature.
 - **Block list** — denied players land in a persistent blocklist so subsequent join attempts are silently ignored.
+- **Manual `/update`** — optional pull + recreate of the `minecraft` service from Telegram when the compose project is mounted into mc-guard (see below).
+- **Log-tail resilience** — mc-guard reconnects to `docker logs` after a Minecraft container restart instead of exiting.
+- **Skip escalation** — Watchtower skip streak is persisted; long runs of “players always online” escalate the wording of the heads-up message.
+- **Heartbeat file** — mc-guard refreshes `/data/.creepwatch_heartbeat` for host-side stale detection.
+- **Restricted Docker CLI** — inside `mc-guard`, `docker` is a wrapper that only allows `exec minecraft rcon-cli`, `logs … minecraft`, and `compose … pull|up` for the `minecraft` service (see `bin/docker-mc-guard.sh`).
 
 ## Commands
 
@@ -41,7 +46,27 @@ Long form and short alias both work.
 | `/online` | `/ol` | Who is online right now |
 | `/activity` | `/ac` | Last 20 join / leave / disconnect events |
 | `/status` | `/st` | Server version and player count |
+| `/kick <player>` | `/k` | Disconnect a player (optional kick message) |
+| `/msg <player> <msg>` | `/tell` | Whisper one player from the server (RCON `msg`) |
+| `/wlreload` | `/wlr` | `whitelist reload` after editing whitelist on disk |
+| `/ban <player>` | `/bn` | Ban (optional reason) |
+| `/banip <target>` | `/bi` | Ban IP / pattern (validated) |
+| `/pardon <player>` | `/pd` | Unban name |
+| `/pardonip <target>` | `/pdi` | Unban IP pattern |
+| `/time …` | — | `query daytime|gametime|day` or `set day|night|noon|midnight|<ticks>` |
+| `/weather …` | — | `clear` / `rain` / `thunder` [seconds] |
+| `/difficulty …` | `/diff` | `peaceful` / `easy` / `normal` / `hard` |
+| `/gamerule …` | `/gr` | Query one rule, or set to `true` / `false` / digits |
 | `/settings` | `/se` | Toggle your own notification categories |
+| `/update` | `/up` | Pull latest MC image and recreate `minecraft` (optional; see README) |
+
+## Security
+
+- **Admins only in private chat** — The bot ignores every update except private DMs where the sender’s Telegram **user id** is listed in `ADMIN_CHAT_IDS`. Commands, the Minecraft chat bridge, and Allow / Deny buttons are not accepted from groups, channels, or strangers (including no reply to random `/start` spam). In BotFather, leave **Allow groups** off so the bot cannot be added to chats you do not control.
+- **Configure user ids, not groups** — Use the positive id from [@userinfobot](https://t.me/userinfobot) in a **private** chat with yourself. Negative ids are groups/supergroups; the bot refuses them at startup.
+- **Docker from mc-guard** — Compose mounts `bin/docker-mc-guard.sh` as `/usr/local/bin/docker` ahead of the real binary (`docker.real`). Only **`docker exec minecraft rcon-cli`**, **`docker logs` … `minecraft` (name last)**, and **`docker compose` … `pull minecraft` / `up -d --no-deps minecraft`** reach the host Docker CLI. RCON stays local to the host via that single `exec` path. The **Docker socket** is still high-trust: malicious code inside the container could talk to it directly without the `docker` binary—keep the image and `mc_guard.py` supply chain trusted.
+- **Secrets** — Treat `TELEGRAM_BOT_TOKEN` and host `.env` like production credentials; rotate the bot token if it leaks.
+- **Attack surface** — Anyone who can Telegram as an admin or SSH the host can trigger the same RCON/compose paths the bot uses.
 
 ## Quick start
 
@@ -60,10 +85,9 @@ Long form and short alias both work.
    ```
 5. Message your bot `/help` from each admin account.
 
-The bot needs the Docker socket and `docker` binary mounted because it tails the
-`minecraft` container's logs and calls `rcon-cli` inside it. That's how it
-detects whitelist rejections, joins, leaves, chat, and `ERROR` lines, and how it
-manages the whitelist and the admin chat bridge.
+The bot needs the Docker socket and a **restricted** `docker` entrypoint (see
+`bin/docker-mc-guard.sh`) so it can tail the `minecraft` container's logs and run
+`rcon-cli` inside that container only.
 
 ## How it works
 
@@ -137,7 +161,42 @@ subject to a per-signature cooldown before Telegram sees it.
 Unit tests live in `test_mc_guard_classifier.py`:
 
 ```sh
+pip install requests   # once, for local runs
 python3 -m unittest discover -v -s . -p 'test_*.py'
+```
+
+GitHub Actions runs the same tests plus `ruff` and `shellcheck` on every push
+to `main` / `dev` (see `.github/workflows/lint.yml`).
+
+### Deploy to your server on merge to `main`
+
+After **lint passes** on a **push to `main`**, the same workflow can SSH to your
+host, `git pull` the repo, and run **`docker compose up -d --no-deps mc-guard`**
+only — the **minecraft** container is not recreated.
+
+1. **On the server** (once): clone this repo to the directory where you run
+   Compose (e.g. `/home/vast/minecraft`), install Docker Compose v2, and ensure
+   `git pull` works (deploy key or HTTPS credentials for GitHub).
+2. **On the server**: add the **public** half of a dedicated SSH key to
+   `~/.ssh/authorized_keys` for the account that will run deploy (often `root`).
+3. **In GitHub** → repository **Settings → Secrets and variables → Actions**,
+   add:
+
+   | Secret | Example |
+   |--------|---------|
+   | `DEPLOY_HOST` | `41.193.204.66` |
+   | `DEPLOY_USER` | `root` |
+   | `DEPLOY_SSH_KEY` | Full private key PEM (the pair from step 2) |
+   | `DEPLOY_PATH` | Absolute path to the compose project on the server |
+   | `DEPLOY_PORT` | Optional; default **22**. Set if SSH listens on another port. |
+
+If `DEPLOY_HOST` is **not** set, the workflow still passes: the SSH deploy steps
+are skipped (so forks and local clones do not fail CI).
+
+Manual equivalent on the host:
+
+```sh
+./scripts/deploy-mc-guard.sh /path/to/compose-project
 ```
 
 ## Auto-update protection
@@ -155,10 +214,65 @@ from under players. Admins can get one Telegram heads-up when a skip is
 notified; subsequent skip attempts within **12 hours** can stay silent thanks to
 a marker file **`.creepwatch_last_skip_notify`** on the Minecraft data volume.
 
+If skips happen on **different calendar days** in a row, a counter in
+**`.creepwatch_skip_streak`** (on the same volume) increments once per day. The
+Telegram text escalates after **3** and **7** consecutive skip days so a stale
+server version is not silent forever. A successful Minecraft version change
+(resetting that streak) is detected by mc-guard when it writes `mc_last_version`.
+
 The first idle window wins: as soon as the lobby is empty the update
 proceeds, creepwatch broadcasts the routine stopping / ready messages when those
 log lines appear, and the version-change detector adds a **Minecraft updated** line if
 a new MC version landed.
+
+## Safe compose deploys
+
+`docker compose up -d <service>` can still recreate **other** services when their
+declared config drifted, because Compose re-evaluates the whole project. That can
+restart `minecraft` when you only meant to roll `mc-guard`.
+
+Use **`bin/safe-deploy.sh`** from the compose project directory:
+
+```sh
+chmod +x bin/safe-deploy.sh
+./bin/safe-deploy.sh mc-guard
+```
+
+It checks `rcon-cli list` for online players (unless `--force`) and runs
+`docker compose up -d --no-deps <service>` so dependency drift does not cascade.
+
+## Manual `/update` from Telegram
+
+Admins can run `/update` or `/up` (and `/update force` to override the online
+player check). The bot runs `docker compose pull minecraft` then
+`docker compose up -d --no-deps minecraft` using **`CREEPWATCH_PROJECT_DIR`**
+as the host directory that contains `docker-compose.yml`.
+
+1. Set `CREEPWATCH_PROJECT_DIR` in `.env` to that absolute path (same directory
+   you run Compose from on the host).
+2. Add a **read-only** bind mount on `mc-guard` so the same files exist inside
+   the container, for example `- /home/you/minecraft:/project:ro` and set
+   `CREEPWATCH_PROJECT_DIR=/project`.
+
+Without the mount + env var, `/update` replies that it is not configured.
+
+## Liveness heartbeat
+
+Every **600** seconds (override with `CREEPWATCH_HEARTBEAT_SEC`) mc-guard writes a
+Unix timestamp to **`/data/.creepwatch_heartbeat`** on the mc-guard bind mount.
+A host cron or external monitor can alert if the file is older than ~30 minutes
+(useful when Telegram itself is the broken channel).
+
+**Host check script:** `scripts/check-creepwatch-heartbeat.sh` exits **1** and prints a
+clear line to stderr when the timestamp file is missing or older than **1800** seconds
+(override with a second argument). Point it at the host path of `.creepwatch_heartbeat`
+next to your compose `data/` directory, then wire it into cron or systemd.
+
+**External ping (optional):** set **`CREEPWATCH_HEALTHCHECK_URL`** (e.g. a
+[Healthchecks.io](https://healthchecks.io/) ping URL) so each heartbeat also issues an
+HTTP GET. If Telegram is down but the process is alive, the file still updates; if the
+bot is wedged, neither the file nor the external ping advances — use the URL as a
+backup notification path (email/SMS from the provider) independent of Telegram.
 
 ## Backups
 
@@ -192,13 +306,20 @@ script after the successful snapshot step.
 ```
 docker-compose.yml
 mc_guard.py
+bin/
+  safe-deploy.sh
+  docker-mc-guard.sh
 scripts/
   pre-update-check.sh
   backup.sh
+  check-creepwatch-heartbeat.sh
+  deploy-mc-guard.sh
 data/                      # bind-mounted into mc-guard (gitignored contents)
 systemd/
 test_mc_guard_classifier.py
 geyser/                    # optional Bedrock bridge
+.github/workflows/
+  lint.yml
 ```
 
 Keep **`.env`**, world data, `backups/`, and runtime files out of git.
