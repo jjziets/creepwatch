@@ -86,6 +86,9 @@ services:
       - ./bin/docker-mc-guard.sh:/usr/local/bin/docker:ro
       - /usr/bin/docker:/usr/bin/docker.real:ro
       - ./mc_guard.py:/app/mc_guard.py
+      # mc_guard.py imports progress_board at module load; mount it next to
+      # the main script so /app/ is a complete python package source dir.
+      - ./progress_board.py:/app/progress_board.py
       - ./data:/data
       - ./scripts:/scripts:ro
       - ./backups:/backups:rw
