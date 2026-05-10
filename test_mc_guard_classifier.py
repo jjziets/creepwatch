@@ -164,5 +164,91 @@ class ErrorClassifierTest(unittest.TestCase):
         self.assertEqual("error", event.kind)
 
 
+class ProgressBoardTest(unittest.TestCase):
+    """The Telegram progress board has to be parser-tight and idempotent.
+
+    A malformed PROGRESS line from the script must not crash mc-guard or
+    move the board into a state the operator can't recognise; partial reads
+    are routine because the script can be mid-write when we poll.
+    """
+
+    def setUp(self):
+        import tempfile
+
+        from progress_board import ProgressBoard, ProgressFileTail
+
+        self.ProgressBoard = ProgressBoard
+        self.ProgressFileTail = ProgressFileTail
+        self._tmp = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        self.addCleanup(lambda: os.unlink(self._tmp.name))
+        self._tmp.close()
+
+    def _write_events(self, *lines: str) -> None:
+        with open(self._tmp.name, "a", encoding="utf-8") as fh:
+            for ln in lines:
+                fh.write(ln)
+                if not ln.endswith("\n"):
+                    fh.write("\n")
+
+    def test_initial_render_has_all_steps_pending(self):
+        board = self.ProgressBoard("backup")
+        text = board.render()
+        self.assertIn("step 1 / 8", text)
+        # All 8 backup steps default to ⏳ (pending) before any update.
+        self.assertEqual(text.count("⏳"), 8)
+        self.assertIn("`▱▱▱▱▱▱▱▱▱▱`", text)
+
+    def test_tail_applies_step_updates_idempotently(self):
+        board = self.ProgressBoard("backup")
+        tail = self.ProgressFileTail(__import__("pathlib").Path(self._tmp.name), board)
+        self._write_events(
+            "PROGRESS\t1\trunning\tPreflight\t",
+            "PROGRESS\t1\tok\tPreflight\t",
+            "PROGRESS\t2\trunning\tSave-all flush\t",
+        )
+        self.assertTrue(tail.poll())
+        # Re-poll without new content must be a no-op (returns False, state unchanged).
+        self.assertFalse(tail.poll())
+        text = board.render()
+        self.assertIn("✅ Preflight", text)
+        self.assertIn("🔄 Save-all flush", text)
+
+    def test_tail_ignores_malformed_lines_and_partial_writes(self):
+        board = self.ProgressBoard("backup")
+        tail = self.ProgressFileTail(__import__("pathlib").Path(self._tmp.name), board)
+        # Junk lines (e.g., a stray log line) and a partial event without
+        # newline must not corrupt board state.
+        self._write_events(
+            "this is not a progress line",
+            "PROGRESS\tnotanint\trunning\tx\ty",
+        )
+        with open(self._tmp.name, "a", encoding="utf-8") as fh:
+            fh.write("PROGRESS\t1\trunn")  # partial, no newline
+        tail.poll()
+        # Step 1 must still be pending — the partial line cannot be applied.
+        self.assertIn("⏳ Preflight", board.render())
+        # Completing the partial line must apply on the next poll.
+        with open(self._tmp.name, "a", encoding="utf-8") as fh:
+            fh.write("ing\tPreflight\t\n")
+        self.assertTrue(tail.poll())
+        self.assertIn("🔄 Preflight", board.render())
+
+    def test_detail_renders_in_backticks(self):
+        board = self.ProgressBoard("backup")
+        board.update(4, "running", "Compress world", "minecraft-20260510T204650Z.tar.gz")
+        text = board.render()
+        self.assertIn("`minecraft-20260510T204650Z.tar.gz`", text)
+        self.assertIn("🔄 Compress world", text)
+
+    def test_mark_done_reflects_failure_step(self):
+        board = self.ProgressBoard("restore")
+        board.update(1, "ok", "Safety snapshot of current world")
+        board.update(2, "fail", "Stop Minecraft", "compose stop failed")
+        board.mark_done(False)
+        text = board.render()
+        self.assertIn("❌ failed at step 2", text)
+        self.assertIn("`compose stop failed`", text)
+
+
 if __name__ == "__main__":
     unittest.main()
