@@ -173,15 +173,21 @@ to `main` / `dev` (see `.github/workflows/lint.yml`).
 
 ### Deploy to your server on merge to `main`
 
-After **lint passes** on a **push to `main`**, the same workflow can SSH to your
-host, `git pull` the repo, and run **`docker compose up -d --no-deps mc-guard`**
-only — the **minecraft** container is not recreated.
+After **lint passes** on a **push to `main`**, the workflow **rsync**s the
+checked-out tree to **`DEPLOY_PATH`** on the host (same commit GitHub built),
+then runs **`docker compose up -d --no-deps mc-guard`** over SSH — the
+**minecraft** container is not recreated. The host directory **does not need to
+be a git clone** (no `.git` required).
 
-1. **On the server** (once): clone this repo to the directory where you run
-   Compose (e.g. `/home/vast/minecraft`), install Docker Compose v2, and ensure
-   `git pull` works (deploy key or HTTPS credentials for GitHub). CI deploy runs
-   `git pull` then `docker compose up -d --no-deps mc-guard` over SSH (it does not
-   rely on `scripts/deploy-mc-guard.sh` being present beforehand).
+**What gets synced:** repo files from CI, excluding **`.git/`**, **`data/`**,
+**`.env`**, **`backups/*.tar.gz`**, and **`.github/`** — so your server secrets,
+world data, and existing backup archives are left alone. **`--mkpath`** creates
+**`DEPLOY_PATH`** if it does not exist yet (needs write permission on the parent).
+
+1. **On the server** (once): pick an absolute **`DEPLOY_PATH`** where you keep
+   `docker-compose.yml` (e.g. `/home/vast/minecraft`). Install Docker Compose v2.
+   You can start from a **manual copy** of the repo or an empty directory; CI
+   will populate tracked files on each deploy.
 2. **On the server**: add the **public** half of a dedicated SSH key to
    `~/.ssh/authorized_keys` for the account that will run deploy (often `root`).
 3. **In GitHub** → repository **Settings → Secrets and variables → Actions**,
@@ -198,11 +204,7 @@ only — the **minecraft** container is not recreated.
 If `DEPLOY_HOST` is **not** set, the workflow still passes: the SSH deploy steps
 are skipped (so forks and local clones do not fail CI).
 
-**`DEPLOY_PATH` must be a git working tree** (contain `.git`) so `git pull` works.
-If you only copied `docker-compose.yml` onto the host, either `git clone` this
-repo into that directory or point **`DEPLOY_PATH`** at the real clone path.
-
-Manual equivalent on the host:
+Manual equivalent on the host (after a local `git pull`):
 
 ```sh
 ./scripts/deploy-mc-guard.sh /path/to/compose-project
