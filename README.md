@@ -195,6 +195,10 @@ only — the **minecraft** container is not recreated.
 If `DEPLOY_HOST` is **not** set, the workflow still passes: the SSH deploy steps
 are skipped (so forks and local clones do not fail CI).
 
+**`DEPLOY_PATH` must be a git working tree** (contain `.git`) so `git pull` works.
+If you only copied `docker-compose.yml` onto the host, either `git clone` this
+repo into that directory or point **`DEPLOY_PATH`** at the real clone path.
+
 Manual equivalent on the host:
 
 ```sh
