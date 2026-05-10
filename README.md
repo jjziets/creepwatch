@@ -21,7 +21,7 @@ in the same Compose stack.
 - **Join / leave alerts** — broadcast on player join and leave.
 - **Per-admin notification prefs** — `/settings` toggles joins, leaves, approvals, rejects, restarts, errors, and in-game **chat** mirrors independently for each admin.
 - **Chat bridge** — admins can send plain text in Telegram and it appears in-game as `[Admin] …` via `tellraw`. In-game `<player> chat` can be mirrored back to Telegram when **Chats** is on.
-- **Server admin commands** — manage whitelist, blocklist, kick players, online players, recent activity, server status.
+- **Server admin commands** — whitelist, blocklist, kick/ban/pardon, direct `msg` to one player, `whitelist reload`, time/weather/difficulty/gamerule, online/activity/status, optional `/update`.
 - **Update notifications** — broadcasts a message only when the Minecraft server version actually changes (silent on routine restarts).
 - **Log error paging** — `ERROR` lines are classified; known noisy patterns are suppressed; real issues go to Telegram with a cooldown per signature.
 - **Block list** — denied players land in a persistent blocklist so subsequent join attempts are silently ignored.
@@ -47,6 +47,16 @@ Long form and short alias both work.
 | `/activity` | `/ac` | Last 20 join / leave / disconnect events |
 | `/status` | `/st` | Server version and player count |
 | `/kick <player>` | `/k` | Disconnect a player (optional kick message) |
+| `/msg <player> <msg>` | `/tell` | Whisper one player from the server (RCON `msg`) |
+| `/wlreload` | `/wlr` | `whitelist reload` after editing whitelist on disk |
+| `/ban <player>` | `/bn` | Ban (optional reason) |
+| `/banip <target>` | `/bi` | Ban IP / pattern (validated) |
+| `/pardon <player>` | `/pd` | Unban name |
+| `/pardonip <target>` | `/pdi` | Unban IP pattern |
+| `/time …` | — | `query daytime|gametime|day` or `set day|night|noon|midnight|<ticks>` |
+| `/weather …` | — | `clear` / `rain` / `thunder` [seconds] |
+| `/difficulty …` | `/diff` | `peaceful` / `easy` / `normal` / `hard` |
+| `/gamerule …` | `/gr` | Query one rule, or set to `true` / `false` / digits |
 | `/settings` | `/se` | Toggle your own notification categories |
 | `/update` | `/up` | Pull latest MC image and recreate `minecraft` (optional; see README) |
 

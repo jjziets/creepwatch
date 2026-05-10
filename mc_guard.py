@@ -180,6 +180,17 @@ def send_admin_chat_to_minecraft(chat_id: int, message: str, admin_name: str):
         log.info(f"Forwarded Telegram admin chat from {admin_name}: {text}")
 
 
+# ── RCON command validation (whitelist console args before rcon-cli) ─────────
+
+MC_PROFILE_NAME = re.compile(r"^[a-zA-Z0-9_]{1,16}$")
+BANIP_TARGET = re.compile(r"^[a-zA-Z0-9_.:*\-]{1,64}$")
+GAMERULE_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{0,63}$")
+TIME_QUERY = frozenset({"daytime", "gametime", "day"})
+TIME_SET_WORD = frozenset({"day", "night", "noon", "midnight"})
+DIFFICULTY = frozenset({"peaceful", "easy", "normal", "hard"})
+WEATHER_KIND = frozenset({"clear", "rain", "thunder"})
+
+
 # ── Telegram helpers ──────────────────────────────────────────────────────────
 
 def _log_telegram_response(op: str, r, exc=None):
@@ -301,6 +312,7 @@ HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
 /whitelist · /wl — list all whitelisted players
 /approve · /a `<player>` — add player to whitelist
 /remove · /rm `<player>` — remove player from whitelist
+/wlreload · /wlr — `whitelist reload` after editing `whitelist.json` on disk
 
 *Blocked*
 /blocked · /bl — list denied players
@@ -310,7 +322,16 @@ HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
 /online · /ol — who is online right now
 /activity · /ac — last 20 join/leave events
 /status · /st — server version and player count
-/kick · /k `<player>` [reason] — disconnect a player (vanilla `kick` via RCON)
+/kick · /k `<player>` [reason] — disconnect a player
+/msg · /tell `<player>` `<message>` — server message to one player (not global chat bridge)
+/ban · /bn `<player>` [reason] — ban name
+/banip · /bi `<target>` [reason] — ban IP or pattern (validated characters only)
+/pardon · /pd `<player>` — unban name
+/pardonip · /pdi `<target>` — unban IP pattern
+/time — query daytime, gametime, day — or set day, night, noon, midnight, or ticks
+/weather — clear, rain, thunder (optional duration in seconds)
+/difficulty · /diff — peaceful, easy, normal, hard
+/gamerule · /gr — query or set; value must be true, false, or digits only
 /update · /up — pull latest MC image and recreate container; use /update force to override online check (needs env CREEPWATCH_PROJECT_DIR + compose mount)
 
 *Notifications*
@@ -436,6 +457,212 @@ def cmd_kick(chat_id: int, arg: str, admin_name: str):
     notify_event("rejects", text, exclude=chat_id)
 
 
+def cmd_msg(chat_id: int, arg: str, admin_name: str):
+    toks = arg.strip().split(None, 1)
+    if len(toks) < 2 or not toks[1].strip():
+        send(chat_id, "Usage: /msg `<player>` `<message>` (same for `/tell`)")
+        return
+    player, body = toks[0], single_line(toks[1], 500)
+    if not MC_PROFILE_NAME.match(player):
+        send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
+        return
+    out = rcon(f"msg {player} {body}")
+    log.info("msg to %s by %s", player, admin_name)
+    pe, ae = md_escape(player), md_escape(admin_name)
+    tail = md_escape(out) if out else "(no output)"
+    text = f"📩 *{pe}* ← server message from {ae}\n{tail}"
+    send(chat_id, text)
+    notify_event("approvals", text, exclude=chat_id)
+
+
+def cmd_whitelist_reload(chat_id: int, arg: str, admin_name: str):
+    if arg.strip():
+        send(chat_id, "Usage: /wlreload (no arguments)")
+        return
+    out = rcon("whitelist reload")
+    log.info("whitelist reload by %s: %s", admin_name, out)
+    ae = md_escape(admin_name)
+    tail = md_escape(out) if out else "(no output)"
+    text = f"🔄 *whitelist reload* by {ae}\n{tail}"
+    send(chat_id, text)
+    notify_event("approvals", text, exclude=chat_id)
+
+
+def cmd_ban(chat_id: int, arg: str, admin_name: str):
+    toks = arg.strip().split(None, 1)
+    if not toks or not toks[0]:
+        send(chat_id, "Usage: /ban `<player>` [reason]")
+        return
+    player = toks[0]
+    if not MC_PROFILE_NAME.match(player):
+        send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
+        return
+    reason = single_line(toks[1], 200) if len(toks) > 1 else ""
+    out = rcon(f"ban {player} {reason}".strip()) if reason else rcon(f"ban {player}")
+    log.info("ban %s by %s", player, admin_name)
+    pe, ae = md_escape(player), md_escape(admin_name)
+    tail = md_escape(out) if out else "(no output)"
+    text = f"⛔ *{pe}* banned by {ae}.\n{tail}"
+    send(chat_id, text)
+    notify_event("rejects", text, exclude=chat_id)
+
+
+def cmd_banip(chat_id: int, arg: str, admin_name: str):
+    toks = arg.strip().split(None, 1)
+    if not toks or not toks[0]:
+        send(chat_id, "Usage: /banip `<ip_or_pattern>` [reason]")
+        return
+    target = toks[0]
+    if not BANIP_TARGET.match(target):
+        send(chat_id, "Invalid ban-ip target (letters, digits, `._:*-` only, max 64).")
+        return
+    reason = single_line(toks[1], 200) if len(toks) > 1 else ""
+    out = rcon(f"ban-ip {target} {reason}".strip()) if reason else rcon(f"ban-ip {target}")
+    log.info("ban-ip %s by %s", target, admin_name)
+    tt, ae = md_escape(target), md_escape(admin_name)
+    tail = md_escape(out) if out else "(no output)"
+    text = f"⛔ `ban-ip` *{tt}* by {ae}.\n{tail}"
+    send(chat_id, text)
+    notify_event("rejects", text, exclude=chat_id)
+
+
+def cmd_pardon(chat_id: int, arg: str, admin_name: str):
+    tok = arg.strip().split(None, 1)
+    player = tok[0] if tok else ""
+    if not player:
+        send(chat_id, "Usage: /pardon `<player>`")
+        return
+    if not MC_PROFILE_NAME.match(player):
+        send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
+        return
+    out = rcon(f"pardon {player}")
+    log.info("pardon %s by %s", player, admin_name)
+    pe, ae = md_escape(player), md_escape(admin_name)
+    tail = md_escape(out) if out else "(no output)"
+    text = f"✅ *{pe}* pardoned by {ae}.\n{tail}"
+    send(chat_id, text)
+    notify_event("approvals", text, exclude=chat_id)
+
+
+def cmd_pardonip(chat_id: int, arg: str, admin_name: str):
+    tok = arg.strip().split(None, 1)
+    target = tok[0] if tok else ""
+    if not target:
+        send(chat_id, "Usage: /pardonip `<ip_or_pattern>`")
+        return
+    if not BANIP_TARGET.match(target):
+        send(chat_id, "Invalid pardon-ip target (letters, digits, `._:*-` only, max 64).")
+        return
+    out = rcon(f"pardon-ip {target}")
+    log.info("pardon-ip %s by %s", target, admin_name)
+    tt, ae = md_escape(target), md_escape(admin_name)
+    tail = md_escape(out) if out else "(no output)"
+    text = f"✅ `pardon-ip` *{tt}* by {ae}.\n{tail}"
+    send(chat_id, text)
+    notify_event("approvals", text, exclude=chat_id)
+
+
+def cmd_time(chat_id: int, arg: str, admin_name: str):
+    parts = arg.strip().split()
+    if len(parts) == 2 and parts[0].lower() == "query":
+        q = parts[1].lower()
+        if q not in TIME_QUERY:
+            send(chat_id, "`time query` must be: `daytime`, `gametime`, or `day`.")
+            return
+        out = rcon(f"time query {q}")
+    elif len(parts) == 2 and parts[0].lower() == "set":
+        raw = parts[1]
+        low = raw.lower()
+        if low in TIME_SET_WORD:
+            out = rcon(f"time set {low}")
+        elif re.fullmatch(r"\d{1,9}", raw):
+            ticks = int(raw)
+            if ticks > 2_147_000_000:
+                send(chat_id, "Tick value too large.")
+                return
+            out = rcon(f"time set {ticks}")
+        else:
+            send(chat_id, "`time set` needs `day`, `night`, `noon`, `midnight`, or tick digits.")
+            return
+    else:
+        send(
+            chat_id,
+            "Usage: `/time query daytime|gametime|day` or `/time set day|night|noon|midnight|<ticks>`",
+        )
+        return
+    log.info("time %s by %s", arg.strip(), admin_name)
+    ae = md_escape(admin_name)
+    tail = md_escape(out) if out else "(no output)"
+    detail = md_escape(" ".join(parts))
+    text = f"🕐 *time* `{detail}` by {ae}\n{tail}"
+    send(chat_id, text)
+    notify_event("approvals", text, exclude=chat_id)
+
+
+def cmd_weather(chat_id: int, arg: str, admin_name: str):
+    parts = arg.strip().split()
+    if len(parts) == 1 and parts[0].lower() in WEATHER_KIND:
+        out = rcon(f"weather {parts[0].lower()}")
+    elif len(parts) == 2 and parts[0].lower() in WEATHER_KIND:
+        if not re.fullmatch(r"\d{1,6}", parts[1]):
+            send(chat_id, "Duration must be 1–6 digits (seconds).")
+            return
+        out = rcon(f"weather {parts[0].lower()} {parts[1]}")
+    else:
+        send(chat_id, "Usage: `/weather clear|rain|thunder` [seconds]")
+        return
+    log.info("weather %s by %s", arg.strip(), admin_name)
+    ae = md_escape(admin_name)
+    tail = md_escape(out) if out else "(no output)"
+    detail = md_escape(" ".join(parts))
+    text = f"🌦️ *weather* `{detail}` by {ae}\n{tail}"
+    send(chat_id, text)
+    notify_event("approvals", text, exclude=chat_id)
+
+
+def cmd_difficulty(chat_id: int, arg: str, admin_name: str):
+    d = arg.strip().lower()
+    if d not in DIFFICULTY:
+        send(chat_id, "Usage: `/difficulty peaceful|easy|normal|hard`")
+        return
+    out = rcon(f"difficulty {d}")
+    log.info("difficulty %s by %s", d, admin_name)
+    ae = md_escape(admin_name)
+    tail = md_escape(out) if out else "(no output)"
+    text = f"⚔️ `difficulty {d}` by {ae}\n{tail}"
+    send(chat_id, text)
+    notify_event("approvals", text, exclude=chat_id)
+
+
+def cmd_gamerule(chat_id: int, arg: str, admin_name: str):
+    toks = arg.strip().split(None, 1)
+    if not toks or not toks[0]:
+        send(chat_id, "Usage: `/gamerule <name>` or `/gamerule <name> <value>`")
+        return
+    name = toks[0]
+    if not GAMERULE_NAME.match(name):
+        send(chat_id, "Invalid gamerule name (letters, digits, underscore; start with a letter).")
+        return
+    if len(toks) == 1:
+        out = rcon(f"gamerule {name}")
+    else:
+        val = toks[1].strip()
+        vlow = val.lower()
+        if vlow in ("true", "false"):
+            out = rcon(f"gamerule {name} {vlow}")
+        elif re.fullmatch(r"\d+", val):
+            out = rcon(f"gamerule {name} {val}")
+        else:
+            send(chat_id, "Gamerule value must be `true`, `false`, or a non-negative integer.")
+            return
+    log.info("gamerule %s by %s", arg.strip(), admin_name)
+    ae = md_escape(admin_name)
+    tail = md_escape(out) if out else "(no output)"
+    text = f"📐 `gamerule` by {ae}\n{tail}"
+    send(chat_id, text)
+    notify_event("approvals", text, exclude=chat_id)
+
+
 def parse_rcon_list_player_count(list_out: str) -> int:
     m = re.search(r"There are (\d+) of a max", list_out, re.IGNORECASE)
     return int(m.group(1)) if m else 0
@@ -544,6 +771,16 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd in ("/activity", "/ac"):         cmd_activity(chat_id)
     elif cmd in ("/status", "/st"):           cmd_status(chat_id)
     elif cmd in ("/kick", "/k"):              cmd_kick(chat_id, arg, sender_name)
+    elif cmd in ("/msg", "/tell"):            cmd_msg(chat_id, arg, sender_name)
+    elif cmd in ("/wlreload", "/wlr"):       cmd_whitelist_reload(chat_id, arg, sender_name)
+    elif cmd in ("/ban", "/bn"):             cmd_ban(chat_id, arg, sender_name)
+    elif cmd in ("/banip", "/bi"):           cmd_banip(chat_id, arg, sender_name)
+    elif cmd in ("/pardon", "/pd"):          cmd_pardon(chat_id, arg, sender_name)
+    elif cmd in ("/pardonip", "/pdi"):       cmd_pardonip(chat_id, arg, sender_name)
+    elif cmd == "/time":                     cmd_time(chat_id, arg, sender_name)
+    elif cmd == "/weather":                  cmd_weather(chat_id, arg, sender_name)
+    elif cmd in ("/difficulty", "/diff"):     cmd_difficulty(chat_id, arg, sender_name)
+    elif cmd in ("/gamerule", "/gr"):        cmd_gamerule(chat_id, arg, sender_name)
     elif cmd in ("/settings", "/se"):         cmd_settings(chat_id)
     elif cmd in ("/update", "/up"):          cmd_update(chat_id, arg, sender_name)
     else:                                     send(chat_id, "Unknown command. Try /help")

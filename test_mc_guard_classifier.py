@@ -57,6 +57,23 @@ class ChatBridgeTest(unittest.TestCase):
         self.assertIn("hello players", command)
 
 
+class RconCommandGateTest(unittest.TestCase):
+    def test_mc_profile_name_accepts_vanilla_style(self):
+        self.assertTrue(mc_guard.MC_PROFILE_NAME.match("Steve"))
+        self.assertTrue(mc_guard.MC_PROFILE_NAME.match("x1"))
+
+    def test_mc_profile_name_rejects_injection_chars(self):
+        self.assertIsNone(mc_guard.MC_PROFILE_NAME.match("a;b"))
+        self.assertIsNone(mc_guard.MC_PROFILE_NAME.match(""))
+
+    def test_banip_target_allows_ipv4(self):
+        self.assertTrue(mc_guard.BANIP_TARGET.match("192.168.0.1"))
+
+    def test_gamerule_name(self):
+        self.assertTrue(mc_guard.GAMERULE_NAME.match("doMobSpawning"))
+        self.assertIsNone(mc_guard.GAMERULE_NAME.match("9bad"))
+
+
 class TelegramAdminLockdownTest(unittest.TestCase):
     def test_private_listed_admin_accepted(self):
         self.assertTrue(
