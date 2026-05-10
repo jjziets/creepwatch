@@ -176,7 +176,9 @@ only — the **minecraft** container is not recreated.
 
 1. **On the server** (once): clone this repo to the directory where you run
    Compose (e.g. `/home/vast/minecraft`), install Docker Compose v2, and ensure
-   `git pull` works (deploy key or HTTPS credentials for GitHub).
+   `git pull` works (deploy key or HTTPS credentials for GitHub). CI deploy runs
+   `git pull` then `docker compose up -d --no-deps mc-guard` over SSH (it does not
+   rely on `scripts/deploy-mc-guard.sh` being present beforehand).
 2. **On the server**: add the **public** half of a dedicated SSH key to
    `~/.ssh/authorized_keys` for the account that will run deploy (often `root`).
 3. **In GitHub** → repository **Settings → Secrets and variables → Actions**,
