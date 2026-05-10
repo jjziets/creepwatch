@@ -314,10 +314,12 @@ backup notification path (email/SMS from the provider) independent of Telegram.
 
 `scripts/backup.sh` snapshots the world without kicking players:
 
+0. **Preflight** (unless `BACKUP_SKIP_PREFLIGHT` is set): `minecraft` container must be **running**, **`level.dat`** must exist on volume `minecraft_data` (under `/data/world` or `/data`), and **free disk** under `BACKUP_DIR` must be at least **`BACKUP_MIN_FREE_MB`** (default **512** MiB). If preflight fails, **no** `save-off` / tar runs and admins get Telegram + stderr.
 1. `rcon save-all flush` — flush pending writes.
 2. `rcon save-off` — pause autosave.
 3. Tar the `minecraft_data` volume from an ephemeral `alpine:latest` container (`docker run` uses **`DOCKER_REAL`** when set, as in mc-guard).
-4. `rcon save-on` — resume autosave (always runs, even if the snapshot fails).
+4. `rcon save-on` — resume autosave. If the tarball succeeded but **save-on** fails, the script **exits with error**, notifies admins, and leaves the tarball in place for inspection.
+5. **Postflight**: archive must be at least **`BACKUP_MIN_ARCHIVE_BYTES`** (default **1 MiB**); then **`gzip -t`** rejects obvious truncation. Bad archives are **removed** before R2 upload.
 
 **`BACKUP_DIR`** defaults to `/home/vast/minecraft/backups` for bare-host cron; mc-guard sets **`BACKUP_DIR=/backups`** (from **`CREEPWATCH_BACKUP_DIR`**, default **`/backups`**) so files land in the repo’s **`./backups`** on the host. Local pruning is either **`BACKUP_MAX_ARCHIVES`** (keep newest *N* tarballs) or, if that is unset, **`BACKUP_RETENTION_DAYS`** (default **7**). Failures are reported to Telegram when **`TELEGRAM_BOT_TOKEN`** / **`ADMIN_CHAT_IDS`** are in the environment or found via **`CREEPWATCH_ENV_FILE`** (or the legacy default `.env` path).
 

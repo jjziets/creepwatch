@@ -6,9 +6,13 @@
 # autosave. Players are not kicked. The save-on step is unconditional so we
 # never leave the world frozen, even if the snapshot fails.
 #
-# Failures (and only failures) are reported to Telegram when TELEGRAM_BOT_TOKEN
-# and ADMIN_CHAT_IDS are set (Compose env) or plucked from CREEPWATCH_ENV_FILE
-# (host cron) or the legacy default path.
+# Failures are reported to Telegram when TELEGRAM_BOT_TOKEN and ADMIN_CHAT_IDS
+# are set (Compose env) or plucked from CREEPWATCH_ENV_FILE (host cron) or the
+# legacy default path. Every failure is also written to stderr for cron/journald.
+#
+# Preflight (before save-off): minecraft container running, world level.dat on
+# the volume, and enough free disk under BACKUP_DIR. Skips backup if unhealthy.
+# Post-tar: gzip -t on the archive rejects obvious truncation/corruption.
 #
 # Optional Cloudflare R2 (S3-compatible): set R2_BUCKET, R2_ACCESS_KEY_ID,
 # R2_SECRET_ACCESS_KEY, R2_S3_ENDPOINT (https://<accountid>.r2.cloudflarestorage.com).
@@ -53,15 +57,22 @@ if [ -f "$env_file" ]; then
     [ -z "${R2_PREFIX:-}" ] && R2_PREFIX=$(pluck R2_PREFIX)
     [ -z "${R2_RETAIN_COUNT:-}" ] && R2_RETAIN_COUNT=$(pluck R2_RETAIN_COUNT)
     [ -z "${BACKUP_MAX_ARCHIVES:-}" ] && BACKUP_MAX_ARCHIVES=$(pluck BACKUP_MAX_ARCHIVES)
+    [ -z "${BACKUP_SKIP_PREFLIGHT:-}" ] && BACKUP_SKIP_PREFLIGHT=$(pluck BACKUP_SKIP_PREFLIGHT)
+    [ -z "${BACKUP_MIN_FREE_MB:-}" ] && BACKUP_MIN_FREE_MB=$(pluck BACKUP_MIN_FREE_MB)
+    [ -z "${BACKUP_MIN_ARCHIVE_BYTES:-}" ] && BACKUP_MIN_ARCHIVE_BYTES=$(pluck BACKUP_MIN_ARCHIVE_BYTES)
     export R2_BUCKET R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_S3_ENDPOINT R2_PREFIX R2_RETAIN_COUNT BACKUP_MAX_ARCHIVES
+    export BACKUP_SKIP_PREFLIGHT BACKUP_MIN_FREE_MB BACKUP_MIN_ARCHIVE_BYTES
 fi
 
 log() { printf '[%s backup] %s\n' "$(date -u +%FT%TZ)" "$*"; }
 
 notify_failure() {
-    [ -z "${TELEGRAM_BOT_TOKEN:-}" ] && return 0
-    [ -z "${ADMIN_CHAT_IDS:-}" ] && return 0
     text="$1"
+    log "FAIL notify: $text"
+    printf '%s\n' "$text" >&2
+    if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${ADMIN_CHAT_IDS:-}" ]; then
+        return 0
+    fi
     saved_ifs=$IFS
     IFS=','
     for chat in $ADMIN_CHAT_IDS; do
@@ -73,40 +84,110 @@ notify_failure() {
     IFS=$saved_ifs
 }
 
+# --- Preflight: do not touch save-off / tar if the host or volume looks bad -----
+BACKUP_MIN_FREE_MB="${BACKUP_MIN_FREE_MB:-512}"
+BACKUP_MIN_ARCHIVE_BYTES="${BACKUP_MIN_ARCHIVE_BYTES:-1048576}"
+
+preflight_backup() {
+    if [ -n "${BACKUP_SKIP_PREFLIGHT:-}" ]; then
+        log "preflight skipped (BACKUP_SKIP_PREFLIGHT set)"
+        return 0
+    fi
+    log "preflight: docker state for minecraft"
+    running=$(docker_cli inspect -f '{{.State.Running}}' minecraft 2>/dev/null) || running=false
+    if [ "$running" != "true" ]; then
+        log "FAIL: minecraft container not running (running=$running)"
+        return 1
+    fi
+    log "preflight: world data on volume minecraft_data"
+    if ! docker_cli run --rm -v minecraft_data:/data:ro alpine:latest sh -c \
+        'test -f /data/world/level.dat || test -f /data/level.dat'; then
+        log "FAIL: no level.dat under /data/world or /data (volume empty or corrupt?)"
+        return 1
+    fi
+    log "preflight: free disk for $BACKUP_DIR"
+    need_kb=$((BACKUP_MIN_FREE_MB * 1024))
+    avail_kb=$(df -Pk "$BACKUP_DIR" 2>/dev/null | awk 'END{print $4}')
+    if [ -z "$avail_kb" ] || ! [ "$avail_kb" -ge 0 ] 2>/dev/null; then
+        log "FAIL: could not read free space (df)"
+        return 1
+    fi
+    if [ "$avail_kb" -lt "$need_kb" ]; then
+        log "FAIL: low disk (${avail_kb} KiB free, need >= ${need_kb} KiB — set BACKUP_MIN_FREE_MB to tune)"
+        return 1
+    fi
+    return 0
+}
+
+if ! preflight_backup; then
+    notify_failure "🚨 Minecraft backup skipped — preflight failed (container not running, missing level.dat on volume, or low disk). No snapshot taken."
+    exit 1
+fi
+
 log "save-all flush"
 if ! docker_cli exec minecraft rcon-cli save-all flush >/dev/null 2>&1; then
     log "FAIL: save-all flush"
-    notify_failure "🚨 Minecraft backup failed at save-all flush. Backup not created."
+    notify_failure "🚨 Minecraft backup failed at save-all flush (RCON). Backup not created — check server logs."
     exit 1
 fi
 
 log "save-off"
 if ! docker_cli exec minecraft rcon-cli save-off >/dev/null 2>&1; then
     log "FAIL: save-off"
-    notify_failure "🚨 Minecraft backup failed at save-off. Backup not created."
+    notify_failure "🚨 Minecraft backup failed at save-off (RCON). Backup not created."
+    docker_cli exec minecraft rcon-cli save-on >/dev/null 2>&1 || true
     exit 1
 fi
 
 log "snapshotting volume to $ARCHIVE_NAME"
 backup_ok=1
+tar_err=$(mktemp)
 if ! docker_cli run --rm \
         -v minecraft_data:/data:ro \
         -v "$BACKUP_DIR":/backups \
         alpine:latest \
-        tar czf "/backups/$ARCHIVE_NAME" -C /data . 2>/dev/null; then
+        tar czf "/backups/$ARCHIVE_NAME" -C /data . 2>"$tar_err"; then
     backup_ok=0
     log "FAIL: tar"
+    tar_tail=$(tail -c 400 "$tar_err" 2>/dev/null | tr '\n' ' ' || true)
+    log "tar stderr tail: $tar_tail"
 fi
+rm -f "$tar_err"
 
 log "save-on"
-docker_cli exec minecraft rcon-cli save-on >/dev/null 2>&1 || log "WARN: save-on returned non-zero"
+saveon_ok=1
+if ! docker_cli exec minecraft rcon-cli save-on >/dev/null 2>&1; then
+    saveon_ok=0
+    log "FAIL: save-on after snapshot"
+fi
 
 if [ "$backup_ok" -ne 1 ]; then
-    notify_failure "🚨 Minecraft backup tar failed. Server autosave re-enabled. Investigate /var/log/minecraft-backup.log or journalctl -u minecraft-backup."
+    notify_failure "🚨 Minecraft backup tar failed. Check disk, volume, and docker logs. save-on was attempted."
+    [ "$saveon_ok" -eq 1 ] || notify_failure "🚨 Minecraft backup: tar failed and save-on also failed — use console/RCON save-on if needed."
     exit 1
 fi
 
-size=$(du -h "$BACKUP_DIR/$ARCHIVE_NAME" 2>/dev/null | cut -f1)
+if [ "$saveon_ok" -ne 1 ]; then
+    notify_failure "🚨 Minecraft backup: tarball OK on disk but save-on failed — autosave may still be off; fix via RCON save-on or restart."
+    exit 1
+fi
+
+archive_path="$BACKUP_DIR/$ARCHIVE_NAME"
+archive_bytes=$(wc -c < "$archive_path" 2>/dev/null | tr -d ' ' || echo 0)
+if ! [ "$archive_bytes" -ge "$BACKUP_MIN_ARCHIVE_BYTES" ] 2>/dev/null; then
+    rm -f "$archive_path"
+    notify_failure "🚨 Minecraft backup rejected: archive too small (${archive_bytes} bytes, min ${BACKUP_MIN_ARCHIVE_BYTES}) — possible corruption or empty world; file removed."
+    exit 1
+fi
+
+log "postflight: gzip integrity test on $ARCHIVE_NAME"
+if ! docker_cli run --rm -v "$BACKUP_DIR":/backups:ro alpine:latest gzip -t "/backups/$ARCHIVE_NAME" 2>/dev/null; then
+    rm -f "$archive_path"
+    notify_failure "🚨 Minecraft backup rejected: gzip -t failed (truncated or corrupt tarball); file removed."
+    exit 1
+fi
+
+size=$(du -h "$archive_path" 2>/dev/null | cut -f1)
 log "backup complete ($size)"
 
 # --- Optional Cloudflare R2 upload + remote retention -----------------------------
