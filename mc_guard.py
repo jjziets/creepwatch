@@ -7,6 +7,7 @@ Minecraft Whitelist Guard Bot
 - Only notifies on actual Minecraft version updates (not routine restarts)
 """
 import subprocess, requests, time, re, logging, os, threading, pathlib, json, datetime
+from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -34,10 +35,56 @@ LOST_CONN_RE  = re.compile(r"(\w+) \([^)]+\) lost connection: You are not white-
 DISCONNECT_RE = re.compile(r"Disconnecting (\w+) \([^)]+\): You are not white-listed", re.IGNORECASE)
 JOINED_RE     = re.compile(r"\]: (\w+) joined the game\s*$")
 LEFT_RE       = re.compile(r"\]: (\w+) left the game\s*$")
+CHAT_RE       = re.compile(r"\]: <([^>]+)> (.+?)\s*$")
 READY_RE      = re.compile(r"Done \([0-9.]+s\)!")
 STOPPING_RE   = re.compile(r"Stopping( the)? server", re.IGNORECASE)
 ERROR_RE      = re.compile(r"\[\d+:\d+:\d+\] \[[^\]]+/ERROR\]:?\s*(.+?)\s*$")
 ERROR_COOLDOWN = 600  # seconds — collapse repeated identical errors
+
+
+@dataclass(frozen=True)
+class ErrorEvent:
+    kind: str
+    signature: str
+    message: str
+    alert: bool = True
+
+
+def _feature_name(err: str) -> str:
+    m = re.search(r"currently generating: ResourceKey\[[^/]+/ ([^\]]+)\]", err)
+    return m.group(1) if m else "unknown_feature"
+
+
+def classify_error(err: str) -> ErrorEvent:
+    """Classify Minecraft ERROR lines before deciding whether Telegram should page admins."""
+    lower = err.lower()
+
+    if "detected setblock in a far chunk" in lower:
+        feature = _feature_name(err)
+        return ErrorEvent(
+            kind="worldgen_far_chunk",
+            signature=f"worldgen_far_chunk:{feature}",
+            message=f"Worldgen far-chunk warning ({feature})",
+            alert=False,
+        )
+
+    if "error sending packet clientbound/minecraft:disconnect" in lower:
+        return ErrorEvent(
+            kind="disconnect_packet",
+            signature="disconnect_packet",
+            message="Error sending packet clientbound/minecraft:disconnect",
+            alert=False,
+        )
+
+    normalized = re.sub(r"BlockPos\{[^}]+\}", "BlockPos{...}", err)
+    normalized = re.sub(r"\[-?\d+,\s*-?\d+\]", "[chunk]", normalized)
+    normalized = re.sub(r"-?\d+", "#", normalized)
+    return ErrorEvent(
+        kind="error",
+        signature=normalized[:120],
+        message=err,
+        alert=True,
+    )
 
 
 # ── RCON helpers ──────────────────────────────────────────────────────────────
@@ -48,6 +95,56 @@ def rcon(cmd: str) -> str:
         return (r.stdout + r.stderr).strip()
     except Exception as e:
         return f"RCON error: {e}"
+
+
+# ── Chat bridge helpers ───────────────────────────────────────────────────────
+
+def markdown_escape(text: str) -> str:
+    """Escape the small Markdown subset Telegram legacy Markdown treats specially."""
+    return (
+        str(text)
+        .replace("\\", "\\\\")
+        .replace("_", "\\_")
+        .replace("*", "\\*")
+        .replace("`", "\\`")
+        .replace("[", "\\[")
+    )
+
+
+def single_line(text: str, limit: int = 300) -> str:
+    compact = " ".join(str(text).split())
+    return compact[:limit]
+
+
+def extract_chat(line: str):
+    m = CHAT_RE.search(line)
+    if not m:
+        return None
+    return m.group(1).strip(), m.group(2).strip()
+
+
+def format_player_chat_for_telegram(player: str, message: str) -> str:
+    return f"💬 *{markdown_escape(player)}*: {markdown_escape(single_line(message, 800))}"
+
+
+def build_admin_tellraw_command(admin_name: str, message: str) -> str:
+    payload = [
+        {"text": "[Admin] ", "color": "gold", "bold": True},
+        {"text": f"{single_line(admin_name, 40)}: ", "color": "yellow"},
+        {"text": single_line(message, 800), "color": "white"},
+    ]
+    return "tellraw @a " + json.dumps(payload, ensure_ascii=False)
+
+
+def send_admin_chat_to_minecraft(chat_id: int, message: str, admin_name: str):
+    text = single_line(message, 800)
+    if not text:
+        return
+    out = rcon(build_admin_tellraw_command(admin_name, text))
+    if out and "RCON error" in out:
+        send(chat_id, f"⚠️ Could not send message to Minecraft: `{markdown_escape(out)}`")
+    else:
+        log.info(f"Forwarded Telegram admin chat from {admin_name}: {text}")
 
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
@@ -86,6 +183,7 @@ DEFAULT_PREFS = {
     "rejects":   True,
     "restarts":  True,
     "errors":    True,
+    "chats":     True,
 }
 
 def blocked_list() -> set:
@@ -136,9 +234,10 @@ def settings_keyboard(prefs: dict) -> dict:
         [{"text": f"Rejects:   {fmt(prefs['rejects'])}",   "callback_data": "toggle:rejects"}],
         [{"text": f"Restarts:  {fmt(prefs['restarts'])}",  "callback_data": "toggle:restarts"}],
         [{"text": f"Errors:    {fmt(prefs['errors'])}",    "callback_data": "toggle:errors"}],
+        [{"text": f"Chats:     {fmt(prefs['chats'])}",     "callback_data": "toggle:chats"}],
     ]}
 
-TOGGLE_KEYS = ("joins", "leaves", "approvals", "rejects", "restarts", "errors")
+TOGGLE_KEYS = ("joins", "leaves", "approvals", "rejects", "restarts", "errors", "chats")
 
 
 HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
@@ -158,7 +257,10 @@ HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
 /status · /st — server version and player count
 
 *Notifications*
-/settings · /se — toggle your join, leave, approval, reject, restart, error alerts
+/settings · /se — toggle your join, leave, approval, reject, restart, error, chat alerts
+
+*Chat bridge*
+Send any non-command message here and it appears in Minecraft as `[Admin]`.
 
 /help · /h — show this message"""
 
@@ -297,23 +399,21 @@ def poll_callbacks():
     for update in r.json().get("result", []):
         offset = update["update_id"] + 1
 
-        # Handle slash commands from admins only
+        # Handle Telegram messages from admins. Commands stay bot commands;
+        # normal text is bridged into Minecraft chat.
         msg = update.get("message", {})
-        if msg.get("text", "").startswith("/"):
+        if msg.get("text"):
             sender_id   = msg["chat"]["id"]
-            sender_name = msg["from"].get("first_name", str(sender_id))
-            if sender_id in ADMIN_CHAT_IDS:
+            sender_name = msg.get("from", {}).get("first_name", str(sender_id))
+            if sender_id not in ADMIN_CHAT_IDS:
+                if msg["text"].startswith("/"):
+                    send(sender_id, "⛔ You are not authorised to manage this server.")
+                continue
+            if msg["text"].startswith("/"):
                 handle_command(sender_id, msg["text"], sender_name)
             else:
-                send(sender_id, "⛔ You are not authorised to manage this server.")
+                send_admin_chat_to_minecraft(sender_id, msg["text"], sender_name)
             continue
-
-        # Ignore all non-command messages silently
-        if msg.get("text"):
-            sender_id = msg["chat"]["id"]
-            if sender_id not in ADMIN_CHAT_IDS:
-                # Don't respond to randoms at all
-                continue
 
         # Handle inline button callbacks
         cb = update.get("callback_query")
@@ -456,12 +556,22 @@ def main():
         m = ERROR_RE.search(line)
         if m:
             err = m.group(1).strip()
-            sig = err[:80]
+            event = classify_error(err)
+            if not event.alert:
+                log.info(f"Suppressed Minecraft log noise ({event.kind}): {event.message}")
+                continue
+            sig = event.signature
             now = time.time()
             if now - recent_errors.get(sig, 0) > ERROR_COOLDOWN:
                 recent_errors[sig] = now
-                safe = err.replace("`", "'")[:500]
+                safe = event.message.replace("`", "'")[:500]
                 notify_event("errors", f"⚠️ *Server error*\n`{safe}`")
+            continue
+
+        chat = extract_chat(line)
+        if chat:
+            player, message = chat
+            notify_event("chats", format_player_chat_for_telegram(player, message))
             continue
 
         m = JOINED_RE.search(line)
