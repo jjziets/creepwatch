@@ -53,13 +53,8 @@ COMPOSE_FILE="$PROJECT/docker-compose.yml"
 
 case "$SPEC" in
   last)
-    ARCHIVE=""
-    for f in "$BACKUP_DIR"/minecraft-*.tar.gz; do
-      [ -f "$f" ] || continue
-      if [ -z "$ARCHIVE" ] || [ "$f" -nt "$ARCHIVE" ]; then
-        ARCHIVE=$f
-      fi
-    done
+    # Filenames sort lexically by UTC timestamp; avoid test -nt (not POSIX sh).
+    ARCHIVE=$(find "$BACKUP_DIR" -maxdepth 1 -name 'minecraft-*.tar.gz' -type f 2>/dev/null | sort -r | head -n 1)
     if [ -z "$ARCHIVE" ] || ! [ -f "$ARCHIVE" ]; then
       log "FAIL: no minecraft-*.tar.gz in $BACKUP_DIR"
       exit 1
