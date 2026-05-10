@@ -839,6 +839,7 @@ def cmd_restore(chat_id: int, arg: str, admin_name: str):
 
 def maintenance_watcher_loop():
     """Run queued backup/restore once the lobby is empty."""
+    global _pending_maintenance
     while True:
         time.sleep(45)
         try:
