@@ -380,43 +380,25 @@ TOGGLE_KEYS = ("joins", "leaves", "approvals", "rejects", "restarts", "errors", 
 
 HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
 
-*Whitelist*
-/whitelist · /wl — list all whitelisted players
-/approve · /a `<player>` — add player to whitelist
-/remove · /rm `<player>` — remove player from whitelist
-/wlreload · /wlr — `whitelist reload` after editing `whitelist.json` on disk
+*Players*  /online · /activity · /status
+/kick `<p>` `[r]` · /msg `<p>` `<m>` · /ban `<p>` `[r]` · /pardon `<p>` · /banip `<t>` · /pardonip `<t>`
 
-*Blocked*
-/blocked · /bl — list denied players
-/unblock · /ub `<player>` — unblock a denied player
+*Whitelist & blocks*
+/whitelist · /approve `<p>` · /remove `<p>` · /wlreload · /blocked · /unblock `<p>`
 
-*Server*
-/online · /ol — who is online right now
-/activity · /ac — last 20 join/leave events
-/status · /st — server version and player count
-/kick · /k `<player>` [reason] — disconnect a player
-/msg · /tell `<player>` `<message>` — server message to one player (not global chat bridge)
-/ban · /bn `<player>` [reason] — ban name
-/banip · /bi `<target>` [reason] — ban IP or pattern (validated characters only)
-/pardon · /pd `<player>` — unban name
-/pardonip · /pdi `<target>` — unban IP pattern
-/time — query daytime, gametime, day — or set day, night, noon, midnight, or ticks
-/weather — clear, rain, thunder (optional duration in seconds)
-/difficulty · /diff — peaceful, easy, normal, hard
-/gamerule · /gr — query or set; value must be true, false, or digits only
-/update · /up — pull latest MC image and recreate container; use /update force to override online check (needs env CREEPWATCH_PROJECT_DIR + compose mount)
-/backup · /bu — snapshot world to tarball (scheduled if online); live step board in your chat
-/restore slots — show restore slots 1–3 (newest first) with UTC times from filenames
-/restore list | last | `1` | `2` | `3` | `<filename>` — list, restore newest, Nth newest, or one by name (scheduled if online); always takes a `pre-restore-*.tar.gz` safety snapshot first
-/logs · /lg `backup`|`restore` [N] — last N lines (max 50) of the backup or restore log
+*World*
+/time · /weather · /difficulty · /gamerule
+/backup — snapshot world (live step board in your chat; queued if anyone is online)
+/restore slots — show slot 1–3 (24h gap rule)
+/restore last`|`1`|`2`|`3`|`<file>` — restore (always takes pre-restore safety snapshot first)
+/update `[force]` — pull latest MC image and recreate (auto pre-update backup)
 
-*Notifications*
-/settings · /se — toggle your join, leave, approval, reject, restart, error, chat alerts
+*Diagnostics*
+/logs `backup`|`restore` `[N]` — tail last N lines (max 50) of the script log
+/settings — toggle which events ping you (joins, leaves, errors, chat, …)
 
-*Chat bridge*
-Send any non-command message here and it appears in Minecraft as `[Admin]`.
-
-/help · /h — show this message"""
+Plain text in this DM relays to in-game chat as `[Admin]`.
+Common aliases: /bu /rs /up /lg /wl /a /rm /bl /ub /ol /ac /st /se /h"""
 
 
 def cmd_whitelist(chat_id: int):
@@ -862,6 +844,62 @@ def run_backup_subprocess(progress_file: str | None = None) -> subprocess.Comple
     )
 
 
+# Slot 2/3 must be at least this far back from the previous slot. Backups
+# taken in the same 24h window only ever populate slot 1, so frequent
+# same-day /backup runs cannot evict day-1 / day-2 restore points from the
+# slot ladder.
+SLOT_GAP_SECONDS = 24 * 3600
+SLOT_COUNT = 3
+
+
+def _archive_basename_to_utc(name: str) -> datetime.datetime | None:
+    m = re.fullmatch(r"minecraft-(\d{8})T(\d{6})Z\.tar\.gz", name)
+    if not m:
+        return None
+    try:
+        return datetime.datetime.strptime(
+            m.group(1) + m.group(2), "%Y%m%d%H%M%S"
+        ).replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+
+
+def pick_slot_archives(
+    names_newest_first: list[str],
+    gap_seconds: int = SLOT_GAP_SECONDS,
+    max_slots: int = SLOT_COUNT,
+) -> list[str]:
+    """Return up to `max_slots` basenames forming a 24h-gap restore ladder.
+
+    Slot 1 = newest archive overall.
+    Slot 2 = newest archive at least `gap_seconds` older than slot 1.
+    Slot 3 = newest archive at least `gap_seconds` older than slot 2.
+
+    Same-day repeats land on slot 1 only; older days stay anchored to
+    slots 2/3. Both backup retention (when slot mode is active) and
+    /restore selection share this function so the displayed slot list
+    matches the kept-on-disk set.
+    """
+    picks: list[str] = []
+    last_ts: datetime.datetime | None = None
+    for n in names_newest_first:
+        ts = _archive_basename_to_utc(n)
+        if ts is None:
+            continue
+        if last_ts is None:
+            picks.append(n)
+            last_ts = ts
+            if len(picks) >= max_slots:
+                break
+            continue
+        if (last_ts - ts).total_seconds() >= gap_seconds:
+            picks.append(n)
+            last_ts = ts
+            if len(picks) >= max_slots:
+                break
+    return picks
+
+
 def sorted_backup_basenames() -> list[str]:
     """Newest-first minecraft-*.tar.gz basenames under BACKUP_DIR."""
     if not BACKUP_DIR.is_dir():
@@ -877,16 +915,43 @@ def restore_spec_error(spec: str) -> str | None:
     s = spec.strip()
     sl = s.lower()
     names = sorted_backup_basenames()
+    slots = pick_slot_archives(names)
     if sl == "last":
-        return "No backups in the backup directory yet." if not names else None
+        return "No backups in the backup directory yet." if not slots else None
     if sl in ("1", "2", "3"):
         i = int(sl)
-        if len(names) < i:
-            return f"Slot {sl} is not available — only {len(names)} backup(s)."
+        if len(slots) < i:
+            return (
+                f"Slot {sl} is not available — only {len(slots)} slot(s) populated "
+                f"(slots 2/3 require ≥24h gap from the previous slot)."
+            )
         return None
     if BACKUP_ARCHIVE_RE.fullmatch(s):
         return None if (BACKUP_DIR / s).is_file() else f"File not found: `{md_escape(s)}`"
     return "Invalid restore target. Use `/restore slots`, `last`, `1`–`3`, or a full backup filename."
+
+
+def resolve_restore_slot(spec: str) -> str | None:
+    """Map `last`/`1`/`2`/`3` to the actual basename via the 24h-gap ladder.
+
+    Pass full filenames through unchanged. Returns None if the spec cannot
+    be resolved (caller has already validated via `restore_spec_error`, but
+    the timing window between validation and resolution can race a prune).
+    """
+    s = spec.strip()
+    sl = s.lower()
+    if BACKUP_ARCHIVE_RE.fullmatch(s):
+        return s
+    slots = pick_slot_archives(sorted_backup_basenames())
+    if not slots:
+        return None
+    if sl == "last":
+        return slots[0]
+    if sl in ("1", "2", "3"):
+        i = int(sl)
+        if i <= len(slots):
+            return slots[i - 1]
+    return None
 
 
 def run_restore_subprocess(restore_arg: str, progress_file: str | None = None) -> subprocess.CompletedProcess:
@@ -1159,32 +1224,22 @@ def cmd_restore(chat_id: int, arg: str, admin_name: str):
 
     sub = parts[0]
     if sub.lower() == "slots":
-        env = _subprocess_env_for_backup_restore()
-        try:
-            r = subprocess.run(
-                ["/bin/sh", str(RESTORE_SCRIPT), "slots"],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-        except Exception as e:
-            send(chat_id, f"⚠️ Could not list slots: `{md_escape(str(e)[:400])}`")
-            return
-        out = (r.stdout or "").strip()
-        if r.returncode != 0:
-            err = (r.stderr or r.stdout or "unknown error").strip()
-            send(chat_id, f"⚠️ `/restore slots` failed: `{md_escape(err[:600])}`")
-            return
-        if not out:
-            send(chat_id, "📂 *Restore slots*\n(no output — is the backup directory empty?)")
-            return
-        body = "\n".join(md_escape(line) for line in out.splitlines())
+        slots = pick_slot_archives(sorted_backup_basenames())
+        lines = []
+        for i in range(1, SLOT_COUNT + 1):
+            tag = " (newest)" if i == 1 else ""
+            if i <= len(slots):
+                bn = slots[i - 1]
+                ts = _archive_basename_to_utc(bn)
+                ts_str = ts.strftime("%Y-%m-%d %H:%M:%S UTC") if ts else "(unparseable timestamp)"
+                lines.append(f"Slot {i}{tag}: `{md_escape(bn)}` — {md_escape(ts_str)}")
+            else:
+                lines.append(f"Slot {i}{tag}: (no backup ≥24h older than slot {i - 1 or 1})")
         send(
             chat_id,
-            "📂 *Restore slots* (`1` = newest, same as `/restore last`)\n"
-            f"{body}\n"
-            "Use `/restore 1` … `/restore 3` or `/restore last` to apply one.",
+            "📂 *Restore slots* (slots 2/3 require ≥24h gap)\n"
+            + "\n".join(lines)
+            + "\nUse `/restore 1`–`3`, `/restore last`, or `/restore <filename>`.",
         )
         return
 
@@ -1221,11 +1276,21 @@ def cmd_restore(chat_id: int, arg: str, admin_name: str):
         send(chat_id, md_escape(err))
         return
 
+    # Resolve the slot here so restore.sh always receives a concrete
+    # basename. That keeps slot logic in one place (mc-guard) and lets
+    # the queued/scheduled path remember the exact archive even if a
+    # later /backup adds a newer one before the lobby empties.
+    resolved = resolve_restore_slot(restore_arg)
+    if resolved is None:
+        send(chat_id, f"⚠️ Could not resolve restore target `{md_escape(restore_arg)}` — try `/restore slots`.")
+        return
+    restore_arg = resolved
+
     if players_online():
         if not schedule_maintenance("restore", chat_id, admin_name, restore_arg):
             send(chat_id, "⛔ Another backup or restore is already scheduled. Wait for the lobby to clear.")
             return
-        send(chat_id, "📌 *Restore scheduled* — players were messaged in-game; it runs when nobody is online.")
+        send(chat_id, f"📌 *Restore scheduled* (`{md_escape(restore_arg)}`) — players were messaged in-game; runs when nobody is online.")
         return
 
     broadcast(

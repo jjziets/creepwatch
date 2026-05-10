@@ -95,6 +95,54 @@ log() {
     printf '%s\n' "$line" >> "$BACKUP_LOG_FILE" 2>/dev/null || true
 }
 
+# ── Slot-set retention helpers ─────────────────────────────────────────────────
+# Slot 2/3 are anchored 24h apart so frequent same-day /backup runs only
+# refresh slot 1. Retention deletes any archive NOT in this slot set so the
+# server (and R2) cannot fill up with redundant near-real-time snapshots.
+
+# stdin: newest-first basenames (one per line). Args: max_slots gap_seconds.
+# stdout: subset forming a 24h-gap restore ladder.
+slot_archives_24h_gap() {
+    sa_max=${1:-3}
+    sa_gap=${2:-86400}
+    sa_last=0
+    sa_n=0
+    while IFS= read -r sa_bn; do
+        [ -z "$sa_bn" ] && continue
+        sa_ts=$(_archive_basename_to_epoch "$sa_bn") || continue
+        if [ "$sa_last" -eq 0 ]; then
+            printf '%s\n' "$sa_bn"
+            sa_last=$sa_ts
+            sa_n=$((sa_n + 1))
+            [ "$sa_n" -ge "$sa_max" ] && break
+        else
+            sa_diff=$((sa_last - sa_ts))
+            if [ "$sa_diff" -ge "$sa_gap" ]; then
+                printf '%s\n' "$sa_bn"
+                sa_last=$sa_ts
+                sa_n=$((sa_n + 1))
+                [ "$sa_n" -ge "$sa_max" ] && break
+            fi
+        fi
+    done
+}
+
+_archive_basename_to_epoch() {
+    abe_bn=$1
+    abe_iso=$(printf '%s\n' "$abe_bn" | sed -n 's/^minecraft-\([0-9][0-9][0-9][0-9]\)\([0-9][0-9]\)\([0-9][0-9]\)T\([0-9][0-9]\)\([0-9][0-9]\)\([0-9][0-9]\)Z\.tar\.gz$/\1-\2-\3T\4:\5:\6Z/p')
+    [ -z "$abe_iso" ] && return 1
+    date -u -d "$abe_iso" +%s 2>/dev/null
+}
+
+sha256_hex() {
+    # Hex SHA-256 of a file, empty on error. We compute this on the local
+    # tarball so R2 uploads carry it as user metadata, letting restore.sh
+    # decide whether to use the local copy or re-pull from R2.
+    sh_path=$1
+    [ -f "$sh_path" ] || return 0
+    sha256sum "$sh_path" 2>/dev/null | awk '{print $1}'
+}
+
 # Emit a structured progress event so mc-guard can render a step board.
 # Args: <step> <status: running|ok|fail|skip> [label] [detail]
 # Label/detail must not contain tabs. mc-guard tails the file by offset.
@@ -300,11 +348,23 @@ r2_object_key() {
 }
 
 progress 7 running "R2 upload"
+archive_sha=$(sha256_hex "$archive_path")
+if [ -n "$archive_sha" ]; then
+    log "sha256 $ARCHIVE_NAME = $archive_sha"
+fi
+
 if r2_fully_configured; then
     R2_PREFIX_NORM=${R2_PREFIX:-minecraft/}
     R2_KEEP=${R2_RETAIN_COUNT:-3}
     r2_key=$(r2_object_key "$R2_PREFIX_NORM" "$ARCHIVE_NAME")
     log "uploading to R2 s3://$R2_BUCKET/$r2_key"
+    # Pass the local SHA-256 as user metadata. restore.sh fetches this via
+    # head-object and skips a re-download when the local file matches.
+    r2_metadata_arg=""
+    if [ -n "$archive_sha" ]; then
+        r2_metadata_arg="--metadata sha256=$archive_sha"
+    fi
+    # shellcheck disable=SC2086 # $r2_metadata_arg is intentionally word-split.
     if ! docker_cli run --rm \
         -e "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
         -e "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
@@ -313,13 +373,14 @@ if r2_fully_configured; then
         amazon/aws-cli:latest \
         s3 cp "/backups/$ARCHIVE_NAME" "s3://${R2_BUCKET}/${r2_key}" \
         --endpoint-url "$R2_S3_ENDPOINT" \
-        --region auto >/dev/null 2>&1; then
+        --region auto \
+        $r2_metadata_arg >/dev/null 2>&1; then
         progress 7 fail "R2 upload" "aws-cli s3 cp failed"
         log "FAIL: R2 upload"
         notify_failure "🚨 Minecraft backup: local tarball OK but R2 upload failed (check R2_* env and bucket policy)."
         exit 1
     fi
-    log "R2 upload ok; pruning remote (keep newest $R2_KEEP)"
+    log "R2 upload ok; computing slot set (24h gap × ${R2_KEEP})"
     if ! r2_ls=$(docker_cli run --rm \
         -e "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
         -e "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
@@ -331,10 +392,17 @@ if r2_fully_configured; then
         log "WARN: R2 list failed; remote prune skipped"
         r2_ls=""
     fi
-    printf '%s\n' "$r2_ls" | awk '$4 ~ /^minecraft-[0-9]{8}T[0-9]{6}Z\.tar\.gz$/ { print $4 }' | sort -r | tail -n "+$((R2_KEEP + 1))" | while IFS= read -r k; do
+    r2_basenames=$(printf '%s\n' "$r2_ls" | awk '$4 ~ /^minecraft-[0-9]{8}T[0-9]{6}Z\.tar\.gz$/ { print $4 }' | sort -r)
+    r2_slot_set=$(printf '%s\n' "$r2_basenames" | slot_archives_24h_gap "$R2_KEEP")
+    log "R2 slot set: $(printf '%s ' "$r2_slot_set")"
+    # Delete from R2 anything NOT in the slot set.
+    printf '%s\n' "$r2_basenames" | while IFS= read -r k; do
         [ -z "$k" ] && continue
+        if printf '%s\n' "$r2_slot_set" | grep -qFx "$k"; then
+            continue
+        fi
         r2_del=$(r2_object_key "$R2_PREFIX_NORM" "$k")
-        log "R2 delete s3://$R2_BUCKET/$r2_del"
+        log "R2 delete s3://$R2_BUCKET/$r2_del (outside slot set)"
         docker_cli run --rm \
             -e "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
             -e "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
@@ -344,8 +412,10 @@ if r2_fully_configured; then
             --endpoint-url "$R2_S3_ENDPOINT" \
             --region auto >/dev/null 2>&1 || log "WARN: R2 rm failed for $k"
     done
-    progress 7 ok "R2 upload" "s3://${R2_BUCKET}/${r2_key} · kept ${R2_KEEP}"
+    n_slots=$(printf '%s\n' "$r2_slot_set" | grep -c . 2>/dev/null || echo 0)
+    progress 7 ok "R2 upload" "s3://${R2_BUCKET}/${r2_key} · kept ${n_slots} slot(s)"
 else
+    r2_slot_set=""
     if [ -n "${R2_BUCKET:-}" ] || [ -n "${R2_ACCESS_KEY_ID:-}" ] || [ -n "${R2_SECRET_ACCESS_KEY:-}" ] || [ -n "${R2_S3_ENDPOINT:-}" ]; then
         log "WARN: R2 partly configured — need R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_S3_ENDPOINT; skipping R2"
         progress 7 skip "R2 upload" "partly configured — skipped"
@@ -355,22 +425,44 @@ else
 fi
 
 # --- Local retention -------------------------------------------------------------
+# Default: local mirrors R2 when configured; otherwise apply the same
+# 24h-gap slot rule locally so same-day repeat /backup runs do not evict
+# day-1 / day-2 anchors. Override with BACKUP_MAX_ARCHIVES (count) for
+# operators who want a flat newest-N policy.
 progress 8 running "Local retention"
+local_basenames=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'minecraft-*.tar.gz' -printf '%f\n' 2>/dev/null | sort -r)
+
 if [ -n "${BACKUP_MAX_ARCHIVES:-}" ]; then
-    # shellcheck disable=SC2016
-    find "$BACKUP_DIR" -maxdepth 1 -type f -name 'minecraft-*.tar.gz' \
-        | sort -r \
-        | tail -n "+$((BACKUP_MAX_ARCHIVES + 1))" \
-        | while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            rm -f "$f" && log "pruned local $f"
-        done
-    log "local retention: newest $BACKUP_MAX_ARCHIVES archive(s)"
-    progress 8 ok "Local retention" "kept newest ${BACKUP_MAX_ARCHIVES}"
+    keep_set=$(printf '%s\n' "$local_basenames" | head -n "$BACKUP_MAX_ARCHIVES")
+    retention_label="kept newest ${BACKUP_MAX_ARCHIVES} (BACKUP_MAX_ARCHIVES)"
+elif [ -n "$r2_slot_set" ]; then
+    keep_set=$r2_slot_set
+    n_keep=$(printf '%s\n' "$keep_set" | grep -c . 2>/dev/null || echo 0)
+    retention_label="mirroring R2 (${n_keep} slot archive(s))"
 else
-    find "$BACKUP_DIR" -name 'minecraft-*.tar.gz' -mtime "+$RETAIN_DAYS" -delete 2>/dev/null || true
-    log "pruned local backups older than $RETAIN_DAYS days"
-    progress 8 ok "Local retention" "pruned > ${RETAIN_DAYS}d"
+    keep_set=$(printf '%s\n' "$local_basenames" | slot_archives_24h_gap "${BACKUP_SLOT_COUNT:-3}")
+    n_keep=$(printf '%s\n' "$keep_set" | grep -c . 2>/dev/null || echo 0)
+    retention_label="local slot set (${n_keep} archive(s), 24h gap × ${BACKUP_SLOT_COUNT:-3})"
 fi
 
+# Always keep the just-created archive even if e.g. a clock skew or a stale
+# R2 listing put it outside the slot set. Anything else not in keep_set
+# gets pruned.
+keep_set=$(printf '%s\n%s\n' "$keep_set" "$ARCHIVE_NAME" | awk 'NF && !seen[$0]++')
+printf '%s\n' "$local_basenames" | while IFS= read -r bn; do
+    [ -z "$bn" ] && continue
+    if printf '%s\n' "$keep_set" | grep -qFx "$bn"; then
+        continue
+    fi
+    rm -f "$BACKUP_DIR/$bn" && log "local prune: $bn (outside keep set)"
+done
+
+# Legacy mtime-based prune as a safety net for any archives that might
+# linger after a rule change; default 7 days. Disabled when explicitly set
+# to 0.
+if [ -z "${BACKUP_MAX_ARCHIVES:-}" ] && [ "$RETAIN_DAYS" -gt 0 ] 2>/dev/null; then
+    find "$BACKUP_DIR" -maxdepth 1 -type f -name 'minecraft-*.tar.gz' -mtime "+$RETAIN_DAYS" -delete 2>/dev/null || true
+fi
+
+progress 8 ok "Local retention" "$retention_label"
 log "done: archive=$ARCHIVE_NAME size=$size"

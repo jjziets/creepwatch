@@ -164,6 +164,84 @@ class ErrorClassifierTest(unittest.TestCase):
         self.assertEqual("error", event.kind)
 
 
+class SlotPickerTest(unittest.TestCase):
+    """The 24h-gap slot picker is what stops same-day repeat /backup runs
+    from evicting day-1 / day-2 anchors. Both backup retention (when R2
+    isn't configured) and /restore <N> resolution call into it, so its
+    contract has to be precise enough to test directly."""
+
+    @staticmethod
+    def _name(ts: str) -> str:
+        # Helper: ts like "20260510T204650" → "minecraft-20260510T204650Z.tar.gz".
+        return f"minecraft-{ts}Z.tar.gz"
+
+    def test_picks_only_newest_when_all_same_day(self):
+        names = [
+            self._name("20260510T230000"),
+            self._name("20260510T204650"),
+            self._name("20260510T204113"),
+            self._name("20260510T020314"),  # same UTC day, ~21h before slot 1
+        ]
+        slots = mc_guard.pick_slot_archives(names)
+        self.assertEqual(slots, [self._name("20260510T230000")])
+
+    def test_three_consecutive_days_each_fill_a_slot(self):
+        names = [
+            self._name("20260510T230000"),
+            self._name("20260509T230000"),
+            self._name("20260508T230000"),
+            self._name("20260507T230000"),
+        ]
+        slots = mc_guard.pick_slot_archives(names)
+        self.assertEqual(slots, names[:3])
+
+    def test_skips_archives_inside_24h_window(self):
+        # Slot 1 = May 10 23:00. Anything within the next 24h backwards is skipped
+        # for slot 2; slot 2 anchors at the first archive ≥24h older.
+        names = [
+            self._name("20260510T230000"),  # slot 1
+            self._name("20260510T120000"),  # 11h older — skipped
+            self._name("20260509T220000"),  # 25h older — slot 2
+            self._name("20260509T100000"),  # 13h older than slot 2 — skipped
+            self._name("20260508T200000"),  # 26h older than slot 2 — slot 3
+        ]
+        slots = mc_guard.pick_slot_archives(names)
+        self.assertEqual(
+            slots,
+            [
+                self._name("20260510T230000"),
+                self._name("20260509T220000"),
+                self._name("20260508T200000"),
+            ],
+        )
+
+    def test_unparseable_basenames_skipped(self):
+        names = [
+            "minecraft-INVALID.tar.gz",
+            self._name("20260510T230000"),
+            "garbage",
+            self._name("20260509T100000"),  # ~37h older
+        ]
+        slots = mc_guard.pick_slot_archives(names)
+        self.assertEqual(
+            slots,
+            [self._name("20260510T230000"), self._name("20260509T100000")],
+        )
+
+    def test_returns_empty_for_empty_input(self):
+        self.assertEqual([], mc_guard.pick_slot_archives([]))
+
+    def test_resolve_restore_slot_passes_through_filenames(self):
+        bn = self._name("20260510T230000")
+        # mc_guard.resolve_restore_slot does an is_file() check via
+        # sorted_backup_basenames; a verbatim filename is returned without
+        # a disk lookup as long as it matches BACKUP_ARCHIVE_RE.
+        self.assertEqual(bn, mc_guard.resolve_restore_slot(bn))
+
+    def test_resolve_restore_slot_returns_none_for_garbage(self):
+        self.assertIsNone(mc_guard.resolve_restore_slot("not-a-spec"))
+
+
 class ProgressBoardTest(unittest.TestCase):
     """The Telegram progress board has to be parser-tight and idempotent.
 

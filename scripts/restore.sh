@@ -73,9 +73,9 @@ usage() {
   exit 2
 }
 
-# Sorted paths, newest first (lexical sort matches UTC timestamp in filename).
-find_backup_archives() {
-  find "$BACKUP_DIR" -maxdepth 1 -name 'minecraft-*.tar.gz' -type f 2>/dev/null | sort -r
+# Sorted basenames, newest first (lexical sort matches the UTC timestamp).
+find_backup_basenames() {
+  find "$BACKUP_DIR" -maxdepth 1 -name 'minecraft-*.tar.gz' -type f -printf '%f\n' 2>/dev/null | sort -r
 }
 
 # Print YYYY-MM-DD HH:MM:SS UTC from basename, or empty if pattern mismatch.
@@ -84,18 +84,126 @@ human_utc_from_bn() {
   echo "$bn" | sed -n 's/^minecraft-\([0-9][0-9][0-9][0-9]\)\([0-9][0-9]\)\([0-9][0-9]\)T\([0-9][0-9]\)\([0-9][0-9]\)\([0-9][0-9]\)Z\.tar\.gz$/\1-\2-\3 \4:\5:\6 UTC/p'
 }
 
+_archive_basename_to_epoch() {
+    abe_bn=$1
+    abe_iso=$(printf '%s\n' "$abe_bn" | sed -n 's/^minecraft-\([0-9][0-9][0-9][0-9]\)\([0-9][0-9]\)\([0-9][0-9]\)T\([0-9][0-9]\)\([0-9][0-9]\)\([0-9][0-9]\)Z\.tar\.gz$/\1-\2-\3T\4:\5:\6Z/p')
+    [ -z "$abe_iso" ] && return 1
+    date -u -d "$abe_iso" +%s 2>/dev/null
+}
+
+# Read newest-first basenames on stdin; print only those forming a 24h-gap
+# slot ladder. Mirrors mc-guard's pick_slot_archives so /restore <N> picks
+# the same archive whether resolved in Python or by the host CLI.
+slot_archives_24h_gap() {
+    sa_max=${1:-3}
+    sa_gap=${2:-86400}
+    sa_last=0
+    sa_n=0
+    while IFS= read -r sa_bn; do
+        [ -z "$sa_bn" ] && continue
+        sa_ts=$(_archive_basename_to_epoch "$sa_bn") || continue
+        if [ "$sa_last" -eq 0 ]; then
+            printf '%s\n' "$sa_bn"
+            sa_last=$sa_ts
+            sa_n=$((sa_n + 1))
+            [ "$sa_n" -ge "$sa_max" ] && break
+        else
+            sa_diff=$((sa_last - sa_ts))
+            if [ "$sa_diff" -ge "$sa_gap" ]; then
+                printf '%s\n' "$sa_bn"
+                sa_last=$sa_ts
+                sa_n=$((sa_n + 1))
+                [ "$sa_n" -ge "$sa_max" ] && break
+            fi
+        fi
+    done
+}
+
+sha256_hex() {
+    sh_path=$1
+    [ -f "$sh_path" ] || return 0
+    sha256sum "$sh_path" 2>/dev/null | awk '{print $1}'
+}
+
+r2_object_key() {
+    pref=${1:-}
+    fn=$2
+    case "$pref" in
+        "") echo "$fn" ;;
+        */) echo "${pref}${fn}" ;;
+        *) echo "${pref}/${fn}" ;;
+    esac
+}
+
+r2_fully_configured() {
+    [ -n "${R2_BUCKET:-}" ] && [ -n "${R2_ACCESS_KEY_ID:-}" ] && [ -n "${R2_SECRET_ACCESS_KEY:-}" ] && [ -n "${R2_S3_ENDPOINT:-}" ]
+}
+
+# Pluck R2 / retention env from .env when invoked outside mc-guard. Same
+# pattern as backup.sh.
+env_file="${CREEPWATCH_ENV_FILE:-/home/vast/minecraft/.env}"
+if [ -f "$env_file" ]; then
+    pluck() { grep -m1 "^$1=" "$env_file" 2>/dev/null | cut -d= -f2- | tr -d '\r'; }
+    [ -z "${TELEGRAM_BOT_TOKEN:-}" ] && TELEGRAM_BOT_TOKEN=$(pluck TELEGRAM_BOT_TOKEN)
+    [ -z "${ADMIN_CHAT_IDS:-}" ] && ADMIN_CHAT_IDS=$(pluck ADMIN_CHAT_IDS)
+    [ -z "${R2_BUCKET:-}" ] && R2_BUCKET=$(pluck R2_BUCKET)
+    [ -z "${R2_ACCESS_KEY_ID:-}" ] && R2_ACCESS_KEY_ID=$(pluck R2_ACCESS_KEY_ID)
+    [ -z "${R2_SECRET_ACCESS_KEY:-}" ] && R2_SECRET_ACCESS_KEY=$(pluck R2_SECRET_ACCESS_KEY)
+    [ -z "${R2_S3_ENDPOINT:-}" ] && R2_S3_ENDPOINT=$(pluck R2_S3_ENDPOINT)
+    [ -z "${R2_PREFIX:-}" ] && R2_PREFIX=$(pluck R2_PREFIX)
+    [ -z "${BACKUP_DOCKER_HOST_DIR:-}" ] && BACKUP_DOCKER_HOST_DIR=$(pluck BACKUP_DOCKER_HOST_DIR)
+    export R2_BUCKET R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_S3_ENDPOINT R2_PREFIX BACKUP_DOCKER_HOST_DIR
+fi
+
+# Re-evaluate after pluck.
+BACKUP_DOCKER_HOST_DIR="${BACKUP_DOCKER_HOST_DIR:-$BACKUP_DIR}"
+
+# Print expected SHA-256 for an R2 object key, or empty if R2 has no
+# `sha256` user metadata (older archives uploaded before this change).
+r2_sha256_for_key() {
+    rk=$1
+    docker_cli run --rm \
+        -e "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
+        -e "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
+        -e "AWS_DEFAULT_REGION=auto" \
+        amazon/aws-cli:latest \
+        s3api head-object --bucket "$R2_BUCKET" --key "$rk" \
+        --endpoint-url "$R2_S3_ENDPOINT" --region auto \
+        --query 'Metadata.sha256' --output text 2>/dev/null \
+        | awk 'NF && $0 != "None" {print; exit}'
+}
+
+# Download an R2 object to BACKUP_DOCKER_HOST_DIR (host path the daemon
+# resolves). Returns 0 on success.
+r2_download_to_local() {
+    rk=$1
+    fn=$2
+    docker_cli run --rm \
+        -e "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
+        -e "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
+        -e "AWS_DEFAULT_REGION=auto" \
+        -v "$BACKUP_DOCKER_HOST_DIR":/dl \
+        amazon/aws-cli:latest \
+        s3 cp "s3://${R2_BUCKET}/${rk}" "/dl/$fn" \
+        --endpoint-url "$R2_S3_ENDPOINT" --region auto >/dev/null 2>&1
+}
+
 # --- slots (no compose / project needed) ---------------------------------------
 if [ "$#" -eq 1 ] && [ "$1" = "slots" ]; then
   mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+  slot_list=$(find_backup_basenames | slot_archives_24h_gap 3)
   i=1
   while [ "$i" -le 3 ]; do
-    path=$(find_backup_archives | sed -n "${i}p")
+    bn=$(printf '%s\n' "$slot_list" | sed -n "${i}p")
     lab=""
     [ "$i" -eq 1 ] && lab=" (newest)"
-    if [ -z "$path" ] || ! [ -f "$path" ]; then
-      printf 'Slot %s%s: (no backup)\n' "$i" "$lab"
+    if [ -z "$bn" ]; then
+      if [ "$i" -eq 1 ]; then
+        printf 'Slot %s%s: (no backup)\n' "$i" "$lab"
+      else
+        printf 'Slot %s%s: (no backup ≥24h older than slot %d)\n' "$i" "$lab" "$((i - 1))"
+      fi
     else
-      bn=$(basename "$path")
       utc=$(human_utc_from_bn "$bn")
       [ -z "$utc" ] && utc="(parse filename for UTC time)"
       printf 'Slot %s%s: %s — %s\n' "$i" "$lab" "$bn" "$utc"
@@ -129,30 +237,87 @@ fi
 
 COMPOSE_FILE="$PROJECT/docker-compose.yml"
 
-# Resolve last | 1 | 2 | 3 | basename → ARCHIVE (abs path) and ARCHIVE_BN
+# Resolve last | 1 | 2 | 3 | basename → ARCHIVE (abs path) and ARCHIVE_BN.
+# Slot resolution uses the same 24h-gap rule as mc-guard, so /restore 2
+# always points at "newest archive ≥24h before slot 1".
 ARCHIVE=""
 ARCHIVE_BN=""
 case "$SPEC" in
   last|1|2|3)
     idx=$SPEC
     case "$SPEC" in last) idx=1 ;; esac
-    ARCHIVE=$(find_backup_archives | sed -n "${idx}p")
-    if [ -z "$ARCHIVE" ] || ! [ -f "$ARCHIVE" ]; then
-      log "FAIL: no backup for slot/spec $SPEC (not enough archives in $BACKUP_DIR)"
+    ARCHIVE_BN=$(find_backup_basenames | slot_archives_24h_gap 3 | sed -n "${idx}p")
+    if [ -z "$ARCHIVE_BN" ]; then
+      log "FAIL: slot $SPEC empty — no archive ≥24h older than slot $((idx - 1)) in $BACKUP_DIR"
       exit 1
     fi
-    ARCHIVE_BN=$(basename "$ARCHIVE")
+    ARCHIVE="$BACKUP_DIR/$ARCHIVE_BN"
     ;;
   *)
     ARCHIVE_BN=$SPEC
     validate_basename "$ARCHIVE_BN" || usage
     ARCHIVE="$BACKUP_DIR/$ARCHIVE_BN"
-    if ! [ -f "$ARCHIVE" ]; then
-      log "FAIL: missing file $ARCHIVE"
-      exit 1
-    fi
     ;;
 esac
+
+# --- Verify or fetch from R2 ---------------------------------------------------
+# Goal: never restore from a local file that we are not sure matches R2,
+# but also never re-download a multi-hundred-MB archive when local already
+# matches. R2 stores the local sha256 as user metadata at upload time.
+local_present=0
+[ -f "$ARCHIVE" ] && local_present=1
+expected_sha=""
+if r2_fully_configured; then
+    R2_PREFIX_NORM=${R2_PREFIX:-minecraft/}
+    r2_key=$(r2_object_key "$R2_PREFIX_NORM" "$ARCHIVE_BN")
+    expected_sha=$(r2_sha256_for_key "$r2_key" || true)
+fi
+
+if [ -n "$expected_sha" ]; then
+    if [ "$local_present" -eq 1 ]; then
+        local_sha=$(sha256_hex "$ARCHIVE")
+        if [ "$local_sha" = "$expected_sha" ]; then
+            log "local matches R2 sha256 (local copy will be used)"
+        else
+            log "local sha256 mismatch (local=$local_sha r2=$expected_sha) — re-downloading from R2"
+            if ! r2_download_to_local "$r2_key" "$ARCHIVE_BN"; then
+                log "FAIL: R2 download for $ARCHIVE_BN"
+                exit 1
+            fi
+            new_sha=$(sha256_hex "$ARCHIVE")
+            if [ "$new_sha" != "$expected_sha" ]; then
+                log "FAIL: post-download sha256 still mismatch (got=$new_sha expected=$expected_sha) — refusing to restore"
+                exit 1
+            fi
+            log "R2 download verified ok"
+        fi
+    else
+        log "local missing — fetching from R2 ($r2_key)"
+        if ! r2_download_to_local "$r2_key" "$ARCHIVE_BN"; then
+            log "FAIL: R2 download for $ARCHIVE_BN"
+            exit 1
+        fi
+        new_sha=$(sha256_hex "$ARCHIVE")
+        if [ "$new_sha" != "$expected_sha" ]; then
+            log "FAIL: downloaded sha256 mismatch (got=$new_sha expected=$expected_sha) — refusing to restore"
+            exit 1
+        fi
+        log "R2 download verified ok"
+    fi
+elif r2_fully_configured && [ "$local_present" -eq 0 ]; then
+    # R2 reachable but no sha metadata (older upload). Pull anyway and trust
+    # the gzip integrity check we do post-extract.
+    log "R2 has no sha256 metadata for $ARCHIVE_BN — downloading without checksum verify"
+    R2_PREFIX_NORM=${R2_PREFIX:-minecraft/}
+    r2_key=$(r2_object_key "$R2_PREFIX_NORM" "$ARCHIVE_BN")
+    if ! r2_download_to_local "$r2_key" "$ARCHIVE_BN"; then
+        log "FAIL: R2 download for $ARCHIVE_BN"
+        exit 1
+    fi
+elif [ "$local_present" -eq 0 ]; then
+    log "FAIL: missing file $ARCHIVE and R2 not configured"
+    exit 1
+fi
 
 log "restore target $ARCHIVE_BN ($ARCHIVE)"
 log "start: target=$ARCHIVE_BN safety=$SAFETY_ARCHIVE backup_dir=$BACKUP_DIR host_dir=$BACKUP_DOCKER_HOST_DIR"
