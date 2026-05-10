@@ -179,8 +179,8 @@ only — the **minecraft** container is not recreated.
    | `DEPLOY_PATH` | Absolute path to the compose project on the server |
    | `DEPLOY_PORT` | Optional; default **22**. Set if SSH listens on another port. |
 
-If `DEPLOY_HOST` is **not** set, the deploy job is skipped (so forks and local
-clones do not fail CI).
+If `DEPLOY_HOST` is **not** set, the workflow still passes: the SSH deploy steps
+are skipped (so forks and local clones do not fail CI).
 
 Manual equivalent on the host:
 

@@ -73,7 +73,13 @@ services:
       - ./data:/data
     # tzdata lets Python's ZoneInfo resolve named zones inside the slim image.
     # PATH prefers /usr/local/bin so `docker` is the wrapper, not docker.real.
-    command: bash -c 'export PATH="/usr/local/bin:/usr/bin:/bin" DOCKER_REAL=/usr/bin/docker.real && pip install requests tzdata -q && python /app/mc_guard.py'
+    command:
+      - bash
+      - -c
+      - |
+        export PATH="/usr/local/bin:/usr/bin:/bin" DOCKER_REAL=/usr/bin/docker.real
+        pip install requests tzdata -q
+        python /app/mc_guard.py
     depends_on:
       - minecraft
     networks:
