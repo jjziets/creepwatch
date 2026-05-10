@@ -156,6 +156,37 @@ python3 -m unittest discover -v -s . -p 'test_*.py'
 GitHub Actions runs the same tests plus `ruff` and `shellcheck` on every push
 to `main` / `dev` (see `.github/workflows/lint.yml`).
 
+### Deploy to your server on merge to `main`
+
+After **lint passes** on a **push to `main`**, the same workflow can SSH to your
+host, `git pull` the repo, and run **`docker compose up -d --no-deps mc-guard`**
+only — the **minecraft** container is not recreated.
+
+1. **On the server** (once): clone this repo to the directory where you run
+   Compose (e.g. `/home/vast/minecraft`), install Docker Compose v2, and ensure
+   `git pull` works (deploy key or HTTPS credentials for GitHub).
+2. **On the server**: add the **public** half of a dedicated SSH key to
+   `~/.ssh/authorized_keys` for the account that will run deploy (often `root`).
+3. **In GitHub** → repository **Settings → Secrets and variables → Actions**,
+   add:
+
+   | Secret | Example |
+   |--------|---------|
+   | `DEPLOY_HOST` | `41.193.204.66` |
+   | `DEPLOY_USER` | `root` |
+   | `DEPLOY_SSH_KEY` | Full private key PEM (the pair from step 2) |
+   | `DEPLOY_PATH` | Absolute path to the compose project on the server |
+   | `DEPLOY_PORT` | Optional; default **22**. Set if SSH listens on another port. |
+
+If `DEPLOY_HOST` is **not** set, the deploy job is skipped (so forks and local
+clones do not fail CI).
+
+Manual equivalent on the host:
+
+```sh
+./scripts/deploy-mc-guard.sh /path/to/compose-project
+```
+
 ## Auto-update protection
 
 The Watchtower service in the bundled Compose stack pulls a fresh
@@ -269,6 +300,7 @@ scripts/
   pre-update-check.sh
   backup.sh
   check-creepwatch-heartbeat.sh
+  deploy-mc-guard.sh
 data/                      # bind-mounted into mc-guard (gitignored contents)
 systemd/
 test_mc_guard_classifier.py

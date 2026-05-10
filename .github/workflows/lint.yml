@@ -33,9 +33,51 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y shellcheck
           shellcheck scripts/pre-update-check.sh scripts/backup.sh \
-            bin/safe-deploy.sh scripts/check-creepwatch-heartbeat.sh
+            bin/safe-deploy.sh scripts/check-creepwatch-heartbeat.sh \
+            scripts/deploy-mc-guard.sh
 
       - name: Compose config
         run: |
           cp .env.example .env
           docker compose -f docker-compose.yml config -q
+
+  # After merge to main: SSH to prod, git pull, recreate only mc-guard (bot).
+  # Configure repo secrets: DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY, DEPLOY_PATH;
+  # optional DEPLOY_PORT (default 22). If DEPLOY_HOST is unset, this job is skipped.
+  deploy_mc_guard:
+    name: Deploy mc-guard (SSH)
+    needs: lint
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.DEPLOY_HOST != ''
+    runs-on: ubuntu-latest
+    concurrency:
+      group: creepwatch-deploy-main
+      cancel-in-progress: false
+    steps:
+      - name: Resolve SSH port
+        id: ssh
+        env:
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+        run: |
+          echo "port=${DEPLOY_PORT:-22}" >> "$GITHUB_OUTPUT"
+
+      - name: Add SSH host key
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${{ steps.ssh.outputs.port }}" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Pull main and restart mc-guard only
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ steps.ssh.outputs.port }}
+          envs: DEPLOY_PATH
+          script: |
+            set -eux
+            cd "$DEPLOY_PATH"
+            sh ./scripts/deploy-mc-guard.sh "$DEPLOY_PATH"
+        env:
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
