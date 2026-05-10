@@ -21,7 +21,7 @@ in the same Compose stack.
 - **Join / leave alerts** — broadcast on player join and leave.
 - **Per-admin notification prefs** — `/settings` toggles joins, leaves, approvals, rejects, restarts, errors, and in-game **chat** mirrors independently for each admin.
 - **Chat bridge** — admins can send plain text in Telegram and it appears in-game as `[Admin] …` via `tellraw`. In-game `<player> chat` can be mirrored back to Telegram when **Chats** is on.
-- **Server admin commands** — manage whitelist, blocklist, online players, recent activity, server status.
+- **Server admin commands** — manage whitelist, blocklist, kick players, online players, recent activity, server status.
 - **Update notifications** — broadcasts a message only when the Minecraft server version actually changes (silent on routine restarts).
 - **Log error paging** — `ERROR` lines are classified; known noisy patterns are suppressed; real issues go to Telegram with a cooldown per signature.
 - **Block list** — denied players land in a persistent blocklist so subsequent join attempts are silently ignored.
@@ -46,6 +46,7 @@ Long form and short alias both work.
 | `/online` | `/ol` | Who is online right now |
 | `/activity` | `/ac` | Last 20 join / leave / disconnect events |
 | `/status` | `/st` | Server version and player count |
+| `/kick <player>` | `/k` | Disconnect a player (optional kick message) |
 | `/settings` | `/se` | Toggle your own notification categories |
 | `/update` | `/up` | Pull latest MC image and recreate `minecraft` (optional; see README) |
 

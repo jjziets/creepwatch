@@ -310,6 +310,7 @@ HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
 /online · /ol — who is online right now
 /activity · /ac — last 20 join/leave events
 /status · /st — server version and player count
+/kick · /k `<player>` [reason] — disconnect a player (vanilla `kick` via RCON)
 /update · /up — pull latest MC image and recreate container; use /update force to override online check (needs env CREEPWATCH_PROJECT_DIR + compose mount)
 
 *Notifications*
@@ -410,6 +411,29 @@ def cmd_unblock(chat_id: int, player: str, admin_name: str):
     text = f"✅ *{pe}* unblocked by {ae}. They can request access again."
     send(chat_id, text)
     notify_event("approvals", text, exclude=chat_id)
+
+
+def cmd_kick(chat_id: int, arg: str, admin_name: str):
+    toks = arg.strip().split(None, 1)
+    if not toks or not toks[0]:
+        send(chat_id, "Usage: /kick `<player>` [reason]")
+        return
+    player = toks[0]
+    reason = toks[1].strip() if len(toks) > 1 else ""
+    if reason:
+        out = rcon(f"kick {player} {reason}")
+    else:
+        out = rcon(f"kick {player}")
+    log.info("Kick %s by %s: %s", player, admin_name, out)
+    pe, ae = md_escape(player), md_escape(admin_name)
+    tail = md_escape(out) if out else "(no output)"
+    if reason:
+        rs = md_escape(single_line(reason, 200))
+        text = f"🥾 *{pe}* kicked by {ae} — {rs}\n{tail}"
+    else:
+        text = f"🥾 *{pe}* kicked by {ae}.\n{tail}"
+    send(chat_id, text)
+    notify_event("rejects", text, exclude=chat_id)
 
 
 def parse_rcon_list_player_count(list_out: str) -> int:
@@ -519,6 +543,7 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd in ("/online", "/ol"):           cmd_online(chat_id)
     elif cmd in ("/activity", "/ac"):         cmd_activity(chat_id)
     elif cmd in ("/status", "/st"):           cmd_status(chat_id)
+    elif cmd in ("/kick", "/k"):              cmd_kick(chat_id, arg, sender_name)
     elif cmd in ("/settings", "/se"):         cmd_settings(chat_id)
     elif cmd in ("/update", "/up"):          cmd_update(chat_id, arg, sender_name)
     else:                                     send(chat_id, "Unknown command. Try /help")
