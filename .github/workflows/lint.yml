@@ -1,5 +1,9 @@
 name: Lint
 
+# Use Node 24 for JavaScript-based actions (GitHub deprecation of Node 20 runners).
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 on:
   push:
     branches: [main, dev]
@@ -10,9 +14,9 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -32,7 +36,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y shellcheck
-          shellcheck scripts/pre-update-check.sh scripts/backup.sh \
+          shellcheck scripts/pre-update-check.sh scripts/backup.sh scripts/restore.sh \
             bin/safe-deploy.sh bin/docker-mc-guard.sh \
             scripts/check-creepwatch-heartbeat.sh scripts/deploy-mc-guard.sh
 
@@ -41,9 +45,9 @@ jobs:
           cp .env.example .env
           docker compose -f docker-compose.yml config -q
 
-  # After merge to main: SSH to prod, git pull, recreate only mc-guard (bot).
-  # Configure repo secrets: DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY, DEPLOY_PATH;
-  # optional DEPLOY_PORT (default 22). Do not use secrets.* in job-level `if` (invalid).
+  # After merge to main: rsync this checkout to DEPLOY_PATH, then recreate mc-guard only.
+  # Secrets: DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY, DEPLOY_PATH; optional DEPLOY_PORT.
+  # Do not use secrets.* in job-level `if` (invalid).
   deploy_mc_guard:
     name: Deploy mc-guard (SSH)
     needs: lint
@@ -65,6 +69,9 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - uses: actions/checkout@v6
+        if: steps.gate.outputs.skip != 'true'
+
       - name: Resolve SSH port
         id: ssh
         if: steps.gate.outputs.skip != 'true'
@@ -81,9 +88,33 @@ jobs:
           mkdir -p ~/.ssh
           ssh-keyscan -p "${{ steps.ssh.outputs.port }}" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
-      - name: Pull main and restart mc-guard only
+      - name: Rsync tree to server (preserves .env, data/, backup tarballs)
         if: steps.gate.outputs.skip != 'true'
-        uses: appleboy/ssh-action@v1.2.2
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+        run: |
+          set -eux
+          PORT="${DEPLOY_PORT:-22}"
+          mkdir -p -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_ci_key
+          chmod 600 ~/.ssh/deploy_ci_key
+          export RSYNC_RSH="ssh -i ${HOME}/.ssh/deploy_ci_key -p ${PORT} -o IdentitiesOnly=yes"
+          rsync -az --mkpath \
+            --exclude '.git/' \
+            --exclude 'data/' \
+            --exclude '.env' \
+            --exclude 'backups/*.tar.gz' \
+            --exclude '.github/' \
+            ./ "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/"
+          rm -f ~/.ssh/deploy_ci_key
+
+      - name: Recreate mc-guard on server
+        if: steps.gate.outputs.skip != 'true'
+        uses: appleboy/ssh-action@v1.2.5
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
@@ -94,14 +125,6 @@ jobs:
             set -eux
             cd "$DEPLOY_PATH"
             test -f docker-compose.yml
-            if ! test -d .git; then
-              echo "ERROR: DEPLOY_PATH must be a git clone (missing .git)." >&2
-              echo "Fix: clone this repo into that path or update DEPLOY_PATH secret." >&2
-              exit 1
-            fi
-            git fetch origin main
-            git checkout main
-            git pull --ff-only origin main
             docker compose -f docker-compose.yml up -d --no-deps mc-guard
         env:
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}

@@ -17,6 +17,14 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 RCON_CMD  = ["docker", "exec", "minecraft", "rcon-cli"]
 API       = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+BACKUP_DIR = pathlib.Path(os.environ.get("CREEPWATCH_BACKUP_DIR", "/backups"))
+BACKUP_SCRIPT = pathlib.Path(os.environ.get("CREEPWATCH_BACKUP_SCRIPT", "/scripts/backup.sh"))
+RESTORE_SCRIPT = pathlib.Path(os.environ.get("CREEPWATCH_RESTORE_SCRIPT", "/scripts/restore.sh"))
+BACKUP_ARCHIVE_RE = re.compile(r"^minecraft-[0-9]{8}T[0-9]{6}Z\.tar\.gz$")
+
+_maintenance_lock = threading.Lock()
+_pending_maintenance: dict | None = None
+
 # Comma-separated Telegram *user* ids (same number as a private DM chat id with
 # this bot from @userinfobot). Only these users may issue commands, use buttons,
 # or bridge chat. Groups/channels are ignored even if the bot were added there.
@@ -333,6 +341,8 @@ HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
 /difficulty · /diff — peaceful, easy, normal, hard
 /gamerule · /gr — query or set; value must be true, false, or digits only
 /update · /up — pull latest MC image and recreate container; use /update force to override online check (needs env CREEPWATCH_PROJECT_DIR + compose mount)
+/backup — snapshot world to tarball (scheduled in-game if players are online)
+/restore list | last | `<filename>` — list backups, restore latest, or restore one by name (scheduled if online)
 
 *Notifications*
 /settings · /se — toggle your join, leave, approval, reject, restart, error, chat alerts
@@ -668,6 +678,214 @@ def parse_rcon_list_player_count(list_out: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def players_online() -> bool:
+    return parse_rcon_list_player_count(rcon("list")) > 0
+
+
+def maintenance_pending() -> bool:
+    with _maintenance_lock:
+        return _pending_maintenance is not None
+
+
+def build_maintenance_scheduled_tellraw(kind: str) -> str:
+    msg = (
+        "A full world backup will run as soon as nobody is online."
+        if kind == "backup"
+        else "The world will be restored from a backup when nobody is online (downtime and rollback)."
+    )
+    payload = [
+        {"text": "[Server] ", "color": "red", "bold": True},
+        {"text": msg, "color": "yellow"},
+    ]
+    return "tellraw @a " + json.dumps(payload, ensure_ascii=False)
+
+
+def schedule_maintenance(kind: str, chat_id: int, admin_name: str, restore_spec: str | None) -> bool:
+    """Return False if another maintenance request is already queued."""
+    global _pending_maintenance
+    with _maintenance_lock:
+        if _pending_maintenance is not None:
+            return False
+        _pending_maintenance = {
+            "kind": kind,
+            "chat_id": chat_id,
+            "admin": admin_name,
+            "restore": restore_spec,
+        }
+    out = rcon(build_maintenance_scheduled_tellraw(kind))
+    if out and "RCON error" in out:
+        log.warning("tellraw maintenance schedule failed: %s", out)
+    ae = md_escape(admin_name)
+    label = "backup" if kind == "backup" else "restore"
+    notify_event("restarts", f"📌 *Maintenance scheduled* ({label}) by {ae} — runs when the server is empty.")
+    return True
+
+
+def _subprocess_env_for_backup_restore() -> dict:
+    env = os.environ.copy()
+    env["BACKUP_DIR"] = str(BACKUP_DIR)
+    project = compose_project_dir()
+    if project:
+        env["CREEPWATCH_PROJECT_DIR"] = project
+    return env
+
+
+def run_backup_subprocess() -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["/bin/sh", str(BACKUP_SCRIPT)],
+        env=_subprocess_env_for_backup_restore(),
+        capture_output=True,
+        text=True,
+        timeout=7200,
+    )
+
+
+def run_restore_subprocess(restore_arg: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["/bin/sh", str(RESTORE_SCRIPT), restore_arg],
+        env=_subprocess_env_for_backup_restore(),
+        capture_output=True,
+        text=True,
+        timeout=7200,
+    )
+
+
+def cmd_backup(chat_id: int, admin_name: str):
+    if not BACKUP_SCRIPT.is_file():
+        send(
+            chat_id,
+            "⚠️ Backup script is not mounted. Add `./scripts:/scripts:ro` on mc-guard and `./backups` (see README).",
+        )
+        return
+    if players_online():
+        if not schedule_maintenance("backup", chat_id, admin_name, None):
+            send(chat_id, "⛔ Another backup or restore is already scheduled. Wait for the lobby to clear.")
+            return
+        send(chat_id, "📌 *Backup scheduled* — players were messaged in-game; it runs when nobody is online.")
+        return
+    broadcast(f"📦 *World backup* started by {md_escape(admin_name)}…")
+    r = run_backup_subprocess()
+    tail = ((r.stdout or "") + (r.stderr or "")).strip()
+    tail = md_escape(tail[-1800:]) if tail else "(no script output)"
+    if r.returncode != 0:
+        broadcast(f"❌ *Backup failed* (exit {r.returncode})\n{tail}")
+        send(chat_id, f"❌ Backup failed.\n{tail}")
+        return
+    broadcast("✅ *World backup* finished.")
+    send(chat_id, "✅ Backup finished successfully.")
+
+
+def cmd_restore(chat_id: int, arg: str, admin_name: str):
+    parts = arg.strip().split()
+    if not parts:
+        send(chat_id, "Usage: `/restore list` · `/restore last` · `/restore <filename>`")
+        return
+    if not RESTORE_SCRIPT.is_file():
+        send(
+            chat_id,
+            "⚠️ Restore script is not mounted. Add `./scripts:/scripts:ro` on mc-guard (see README).",
+        )
+        return
+    if not compose_project_dir():
+        send(
+            chat_id,
+            "⚠️ Restore needs `CREEPWATCH_PROJECT_DIR` plus a read-only compose project mount (same as `/update`).",
+        )
+        return
+    if not BACKUP_DIR.is_dir():
+        send(chat_id, f"⚠️ Backup directory missing: `{md_escape(str(BACKUP_DIR))}`")
+        return
+
+    sub = parts[0]
+    if sub.lower() == "list":
+        names = sorted(
+            (p.name for p in BACKUP_DIR.iterdir() if p.is_file() and BACKUP_ARCHIVE_RE.fullmatch(p.name)),
+            reverse=True,
+        )
+        if not names:
+            send(chat_id, "📂 No `minecraft-*.tar.gz` backups in the backup directory yet.")
+            return
+        body = "\n".join(f"`{md_escape(n)}`" for n in names[:25])
+        more = "\n…" if len(names) > 25 else ""
+        send(chat_id, f"📂 *Backups* (newest first)\n{body}{more}")
+        return
+
+    restore_arg = "last" if sub.lower() == "last" else sub
+    if restore_arg != "last" and not BACKUP_ARCHIVE_RE.fullmatch(restore_arg):
+        send(chat_id, "Invalid backup name. Use `/restore list` or `/restore last`.")
+        return
+    if restore_arg != "last" and not (BACKUP_DIR / restore_arg).is_file():
+        send(chat_id, f"⚠️ File not found: `{md_escape(restore_arg)}`")
+        return
+
+    if players_online():
+        if not schedule_maintenance("restore", chat_id, admin_name, restore_arg):
+            send(chat_id, "⛔ Another backup or restore is already scheduled. Wait for the lobby to clear.")
+            return
+        send(chat_id, "📌 *Restore scheduled* — players were messaged in-game; it runs when nobody is online.")
+        return
+
+    broadcast(f"🔄 *World restore* (`{md_escape(restore_arg)}`) by {md_escape(admin_name)} — stopping Minecraft…")
+    r = run_restore_subprocess(restore_arg)
+    tail = ((r.stdout or "") + (r.stderr or "")).strip()
+    tail = md_escape(tail[-1800:]) if tail else "(no script output)"
+    if r.returncode != 0:
+        broadcast(f"❌ *Restore failed* (exit {r.returncode})\n{tail}")
+        send(chat_id, f"❌ Restore failed.\n{tail}")
+        return
+    broadcast("✅ *World restore* finished — Minecraft was started again.")
+    send(chat_id, "✅ Restore finished. Watch logs for server ready.")
+
+
+def maintenance_watcher_loop():
+    """Run queued backup/restore once the lobby is empty."""
+    while True:
+        time.sleep(45)
+        try:
+            with _maintenance_lock:
+                pending = _pending_maintenance
+            if pending is None:
+                continue
+            if players_online():
+                continue
+            with _maintenance_lock:
+                if _pending_maintenance is not pending:
+                    continue
+                _pending_maintenance = None
+                job = pending
+            kind = job["kind"]
+            req_chat = job["chat_id"]
+            admin_label = job["admin"]
+            ae = md_escape(admin_label)
+            if kind == "backup":
+                broadcast(f"📦 *Scheduled backup* (requested by {ae}) — lobby empty, running now…")
+                r = run_backup_subprocess()
+                tail = ((r.stdout or "") + (r.stderr or "")).strip()
+                tail = md_escape(tail[-1800:]) if tail else "(no script output)"
+                if r.returncode != 0:
+                    broadcast(f"❌ *Scheduled backup failed* (exit {r.returncode})\n{tail}")
+                    send(req_chat, f"❌ Scheduled backup failed.\n{tail}")
+                else:
+                    broadcast("✅ *Scheduled backup* finished.")
+                    send(req_chat, "✅ Your scheduled backup finished successfully.")
+            else:
+                spec = job.get("restore") or "last"
+                broadcast(
+                    f"🔄 *Scheduled restore* (`{md_escape(spec)}`, by {ae}) — lobby empty, stopping Minecraft…"
+                )
+                r = run_restore_subprocess(spec)
+                tail = ((r.stdout or "") + (r.stderr or "")).strip()
+                tail = md_escape(tail[-1800:]) if tail else "(no script output)"
+                if r.returncode != 0:
+                    broadcast(f"❌ *Scheduled restore failed* (exit {r.returncode})\n{tail}")
+                    send(req_chat, f"❌ Scheduled restore failed.\n{tail}")
+                else:
+                    broadcast("✅ *Scheduled restore* finished — Minecraft was started again.")
+                    send(req_chat, "✅ Your scheduled restore finished. Watch logs for server ready.")
+        except Exception:
+            log.exception("maintenance_watcher_loop")
+
+
 def compose_project_dir() -> str | None:
     """Host directory mounted read-only with docker-compose.yml (for /update)."""
     p = os.environ.get("CREEPWATCH_PROJECT_DIR", "").strip()
@@ -679,7 +897,7 @@ def compose_project_dir() -> str | None:
 
 
 def run_mc_update_job(admin_label: str, force: bool):
-    """Run in a background thread: pull + recreate minecraft."""
+    """Run in a background thread: optional backup, then pull + recreate minecraft."""
     try:
         list_out = rcon("list")
         n = parse_rcon_list_player_count(list_out)
@@ -698,6 +916,17 @@ def run_mc_update_job(admin_label: str, force: bool):
             )
             return
         ae = md_escape(admin_label)
+        if BACKUP_SCRIPT.is_file():
+            broadcast(f"📦 *Pre-update backup* by {ae}…")
+            br = run_backup_subprocess()
+            br_tail = ((br.stdout or "") + (br.stderr or "")).strip()
+            br_tail = md_escape(br_tail[-1800:]) if br_tail else "(no script output)"
+            if br.returncode != 0:
+                broadcast(f"❌ *Pre-update backup failed* — update aborted (exit {br.returncode}).\n{br_tail}")
+                return
+            broadcast("✅ *Pre-update backup* finished — continuing with pull.")
+        else:
+            log.warning("BACKUP_SCRIPT missing at %s — skipping pre-update backup", BACKUP_SCRIPT)
         broadcast(f"🛑 *Manual Minecraft update* by {ae} — pulling image and recreating `minecraft`…")
         compose = pathlib.Path(project) / "docker-compose.yml"
         base_cmd = [
@@ -731,6 +960,13 @@ def run_mc_update_job(admin_label: str, force: bool):
 def cmd_update(chat_id: int, arg: str, admin_name: str):
     parts = arg.lower().split()
     force = "force" in parts
+    if maintenance_pending():
+        send(
+            chat_id,
+            "⛔ A scheduled backup or restore is waiting for an empty server. "
+            "Wait for it to finish or for the lobby to clear.",
+        )
+        return
     list_out = rcon("list")
     n = parse_rcon_list_player_count(list_out)
     if n > 0 and not force:
@@ -782,6 +1018,8 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd in ("/difficulty", "/diff"):     cmd_difficulty(chat_id, arg, sender_name)
     elif cmd in ("/gamerule", "/gr"):        cmd_gamerule(chat_id, arg, sender_name)
     elif cmd in ("/settings", "/se"):         cmd_settings(chat_id)
+    elif cmd in ("/backup", "/bu"):          cmd_backup(chat_id, sender_name)
+    elif cmd in ("/restore", "/rs"):         cmd_restore(chat_id, arg, sender_name)
     elif cmd in ("/update", "/up"):          cmd_update(chat_id, arg, sender_name)
     else:                                     send(chat_id, "Unknown command. Try /help")
 
@@ -1029,6 +1267,7 @@ def main():
     # Check version in background so log tailing starts immediately
     threading.Thread(target=check_version_and_notify, daemon=False).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
+    threading.Thread(target=maintenance_watcher_loop, daemon=True).start()
 
     already_notified = set()
     recent_errors    = {}  # signature -> last_seen_ts

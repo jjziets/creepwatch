@@ -57,6 +57,18 @@ class ChatBridgeTest(unittest.TestCase):
         self.assertIn("hello players", command)
 
 
+class BackupArchiveNameTest(unittest.TestCase):
+    def test_valid_backup_filename(self):
+        self.assertTrue(
+            mc_guard.BACKUP_ARCHIVE_RE.fullmatch("minecraft-20260510T120000Z.tar.gz")
+        )
+
+    def test_rejects_wrong_timestamp_or_suffix(self):
+        self.assertIsNone(mc_guard.BACKUP_ARCHIVE_RE.fullmatch("minecraft-20260510120000Z.tar.gz"))
+        self.assertIsNone(mc_guard.BACKUP_ARCHIVE_RE.fullmatch("minecraft-20260510T120000Z.zip"))
+        self.assertIsNone(mc_guard.BACKUP_ARCHIVE_RE.fullmatch("other-20260510T120000Z.tar.gz"))
+
+
 class RconCommandGateTest(unittest.TestCase):
     def test_mc_profile_name_accepts_vanilla_style(self):
         self.assertTrue(mc_guard.MC_PROFILE_NAME.match("Steve"))

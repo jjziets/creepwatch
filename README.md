@@ -25,11 +25,12 @@ in the same Compose stack.
 - **Update notifications** — broadcasts a message only when the Minecraft server version actually changes (silent on routine restarts).
 - **Log error paging** — `ERROR` lines are classified; known noisy patterns are suppressed; real issues go to Telegram with a cooldown per signature.
 - **Block list** — denied players land in a persistent blocklist so subsequent join attempts are silently ignored.
-- **Manual `/update`** — optional pull + recreate of the `minecraft` service from Telegram when the compose project is mounted into mc-guard (see below).
+- **Manual `/update`** — optional pull + recreate of the `minecraft` service from Telegram when the compose project is mounted into mc-guard (see below); runs a **world backup first** when `scripts/backup.sh` is mounted.
+- **Telegram backups / restore** — `/backup` and `/restore` (list, last, or a specific `minecraft-*.tar.gz`); if anyone is online the op is **scheduled** and players see an in-game notice; otherwise it runs immediately.
 - **Log-tail resilience** — mc-guard reconnects to `docker logs` after a Minecraft container restart instead of exiting.
 - **Skip escalation** — Watchtower skip streak is persisted; long runs of “players always online” escalate the wording of the heads-up message.
 - **Heartbeat file** — mc-guard refreshes `/data/.creepwatch_heartbeat` for host-side stale detection.
-- **Restricted Docker CLI** — inside `mc-guard`, `docker` is a wrapper that only allows `exec minecraft rcon-cli`, `logs … minecraft`, and `compose … pull|up` for the `minecraft` service (see `bin/docker-mc-guard.sh`).
+- **Restricted Docker CLI** — inside `mc-guard`, `docker` is a wrapper that only allows `exec minecraft rcon-cli`, `logs … minecraft`, and `compose … pull|up|stop|start` for the `minecraft` service (see `bin/docker-mc-guard.sh`). Backup and restore shell scripts call **`docker.real`** directly for `docker run` volume snapshots (same mounted binary as `/update` compose).
 
 ## Commands
 
@@ -59,12 +60,14 @@ Long form and short alias both work.
 | `/gamerule …` | `/gr` | Query one rule, or set to `true` / `false` / digits |
 | `/settings` | `/se` | Toggle your own notification categories |
 | `/update` | `/up` | Pull latest MC image and recreate `minecraft` (optional; see README) |
+| `/backup` | `/bu` | World tarball backup (scheduled in-game if players are online) |
+| `/restore` | `/rs` | `list` · `last` · `<minecraft-…Z.tar.gz>` — restore world from backup (scheduled if online) |
 
 ## Security
 
 - **Admins only in private chat** — The bot ignores every update except private DMs where the sender’s Telegram **user id** is listed in `ADMIN_CHAT_IDS`. Commands, the Minecraft chat bridge, and Allow / Deny buttons are not accepted from groups, channels, or strangers (including no reply to random `/start` spam). In BotFather, leave **Allow groups** off so the bot cannot be added to chats you do not control.
 - **Configure user ids, not groups** — Use the positive id from [@userinfobot](https://t.me/userinfobot) in a **private** chat with yourself. Negative ids are groups/supergroups; the bot refuses them at startup.
-- **Docker from mc-guard** — Compose mounts `bin/docker-mc-guard.sh` as `/usr/local/bin/docker` ahead of the real binary (`docker.real`). Only **`docker exec minecraft rcon-cli`**, **`docker logs` … `minecraft` (name last)**, and **`docker compose` … `pull minecraft` / `up -d --no-deps minecraft`** reach the host Docker CLI. RCON stays local to the host via that single `exec` path. The **Docker socket** is still high-trust: malicious code inside the container could talk to it directly without the `docker` binary—keep the image and `mc_guard.py` supply chain trusted.
+- **Docker from mc-guard** — Compose mounts `bin/docker-mc-guard.sh` as `/usr/local/bin/docker` ahead of the real binary (`docker.real`). Only **`docker exec minecraft rcon-cli`**, **`docker logs` … `minecraft` (name last)**, and **`docker compose` … `pull` / `up -d --no-deps` / `stop` / `start` for `minecraft`** reach the host Docker CLI through that wrapper. **`scripts/backup.sh`** and **`scripts/restore.sh`** invoke **`docker.real`** for `docker run` volume work (not passed through the wrapper). RCON stays local to the host via the `exec` path. The **Docker socket** is still high-trust: malicious code inside the container could talk to it directly without the `docker` binary—keep the image and `mc_guard.py` supply chain trusted.
 - **Secrets** — Treat `TELEGRAM_BOT_TOKEN` and host `.env` like production credentials; rotate the bot token if it leaks.
 - **Attack surface** — Anyone who can Telegram as an admin or SSH the host can trigger the same RCON/compose paths the bot uses.
 
@@ -170,15 +173,21 @@ to `main` / `dev` (see `.github/workflows/lint.yml`).
 
 ### Deploy to your server on merge to `main`
 
-After **lint passes** on a **push to `main`**, the same workflow can SSH to your
-host, `git pull` the repo, and run **`docker compose up -d --no-deps mc-guard`**
-only — the **minecraft** container is not recreated.
+After **lint passes** on a **push to `main`**, the workflow **rsync**s the
+checked-out tree to **`DEPLOY_PATH`** on the host (same commit GitHub built),
+then runs **`docker compose up -d --no-deps mc-guard`** over SSH — the
+**minecraft** container is not recreated. The host directory **does not need to
+be a git clone** (no `.git` required).
 
-1. **On the server** (once): clone this repo to the directory where you run
-   Compose (e.g. `/home/vast/minecraft`), install Docker Compose v2, and ensure
-   `git pull` works (deploy key or HTTPS credentials for GitHub). CI deploy runs
-   `git pull` then `docker compose up -d --no-deps mc-guard` over SSH (it does not
-   rely on `scripts/deploy-mc-guard.sh` being present beforehand).
+**What gets synced:** repo files from CI, excluding **`.git/`**, **`data/`**,
+**`.env`**, **`backups/*.tar.gz`**, and **`.github/`** — so your server secrets,
+world data, and existing backup archives are left alone. **`--mkpath`** creates
+**`DEPLOY_PATH`** if it does not exist yet (needs write permission on the parent).
+
+1. **On the server** (once): pick an absolute **`DEPLOY_PATH`** where you keep
+   `docker-compose.yml` (e.g. `/home/vast/minecraft`). Install Docker Compose v2.
+   You can start from a **manual copy** of the repo or an empty directory; CI
+   will populate tracked files on each deploy.
 2. **On the server**: add the **public** half of a dedicated SSH key to
    `~/.ssh/authorized_keys` for the account that will run deploy (often `root`).
 3. **In GitHub** → repository **Settings → Secrets and variables → Actions**,
@@ -195,11 +204,7 @@ only — the **minecraft** container is not recreated.
 If `DEPLOY_HOST` is **not** set, the workflow still passes: the SSH deploy steps
 are skipped (so forks and local clones do not fail CI).
 
-**`DEPLOY_PATH` must be a git working tree** (contain `.git`) so `git pull` works.
-If you only copied `docker-compose.yml` onto the host, either `git clone` this
-repo into that directory or point **`DEPLOY_PATH`** at the real clone path.
-
-Manual equivalent on the host:
+Manual equivalent on the host (after a local `git pull`):
 
 ```sh
 ./scripts/deploy-mc-guard.sh /path/to/compose-project
@@ -260,7 +265,32 @@ as the host directory that contains `docker-compose.yml`.
    the container, for example `- /home/you/minecraft:/project:ro` and set
    `CREEPWATCH_PROJECT_DIR=/project`.
 
-Without the mount + env var, `/update` replies that it is not configured.
+Without the mount + env var, `/update` and `/restore` reply that they are not configured.
+
+## Backups and restore
+
+**Layout:** Compose mounts **`./scripts` → `/scripts`** (read-only) and **`./backups` → `/backups`** (read-write) into `mc-guard`. Tarballs use UTC names `minecraft-YYYYMMDDTHHMMSSZ.tar.gz`.
+
+**Telegram:** Admins use **`/backup`** (alias **`/bu`**) and **`/restore list`**, **`/restore last`**, or **`/restore <filename>`** (`/rs`). If **anyone is online**, the bot **queues** the job, sends a **`tellraw @a`** heads-up in Minecraft, and runs the script automatically once **`rcon list`** shows zero players (polled about every 45 seconds). Only **one** queued maintenance job is allowed at a time. **`/update`** is blocked while a backup or restore is queued.
+
+**Manual update:** The background **`/update`** job runs **`scripts/backup.sh`** before **`docker compose pull`** / **`up`** when the backup script is present. If that backup fails, the update is **aborted**.
+
+**Host / cron:** You can still run **`scripts/backup.sh`** from the host (set **`BACKUP_DIR`**, optional **`DOCKER_REAL`**, **`CREEPWATCH_ENV_FILE`** for Telegram failure alerts). **`scripts/restore.sh`** needs **`CREEPWATCH_PROJECT_DIR`** pointing at the compose project and **`BACKUP_DIR`**; it **`stop`s** `minecraft`, wipes the **`minecraft_data`** volume contents from a sidecar container, extracts the tarball, then **`start`s** `minecraft` again — **destructive**.
+
+**Watchtower:** The pre-update hook runs **inside** the `minecraft` container and only checks **`list`**; it cannot run the full **`docker run`** backup flow. For an image update **right before** Watchtower’s window, schedule a host **`backup.sh`** (for example systemd timer or cron shortly before the Watchtower hours in **`TZ`**).
+
+### Git LFS vs world tarballs
+
+[Git LFS](https://docs.github.com/en/repositories/working-with-files/managing-large-files/about-git-large-file-storage) is billed separately from git storage; free-tier quotas are modest and rotate with **bandwidth** as well as **storage**. World archives are large, frequent, and a poor fit for LFS compared with **object storage** (S3, B2, …), **rsync**, or **restic** off the host `backups/` directory.
+
+Check the CLI locally:
+
+```sh
+git lfs version
+git lfs env   # shows remote LFS URL and whether upload/download credentials are available
+```
+
+`git lfs env` does **not** print your GitHub plan quota; see **GitHub → Settings → Billing** (or organisation billing) for LFS storage and bandwidth.
 
 ## Liveness heartbeat
 
@@ -280,32 +310,35 @@ HTTP GET. If Telegram is down but the process is alive, the file still updates; 
 bot is wedged, neither the file nor the external ping advances — use the URL as a
 backup notification path (email/SMS from the provider) independent of Telegram.
 
-## Backups
+## Backup script details
 
-`scripts/backup.sh` produces a nightly tarball of the Minecraft world without
-kicking players. The flow is the standard quiesce-and-snapshot pattern:
+`scripts/backup.sh` snapshots the world without kicking players:
 
+0. **Preflight** (unless `BACKUP_SKIP_PREFLIGHT` is set): `minecraft` container must be **running**, **`level.dat`** must exist on volume `minecraft_data` (under `/data/world` or `/data`), and **free disk** under `BACKUP_DIR` must be at least **`BACKUP_MIN_FREE_MB`** (default **512** MiB). If preflight fails, **no** `save-off` / tar runs and admins get Telegram + stderr.
 1. `rcon save-all flush` — flush pending writes.
 2. `rcon save-off` — pause autosave.
-3. Tar the `minecraft_data` volume from an ephemeral `alpine:latest` container.
-4. `rcon save-on` — resume autosave (always runs, even if the snapshot fails).
+3. Tar the `minecraft_data` volume from an ephemeral `alpine:latest` container (`docker run` uses **`DOCKER_REAL`** when set, as in mc-guard).
+4. `rcon save-on` — resume autosave. If the tarball succeeded but **save-on** fails, the script **exits with error**, notifies admins, and leaves the tarball in place for inspection.
+5. **Postflight**: archive must be at least **`BACKUP_MIN_ARCHIVE_BYTES`** (default **1 MiB**); then **`gzip -t`** rejects obvious truncation. Bad archives are **removed** before R2 upload.
 
-By default tarballs land under `backups/` relative to the compose project (the
-production host uses `/home/vast/minecraft/backups/`). Old archives are pruned after **7 days**
-(override via `BACKUP_RETENTION_DAYS`). Failures are reported to Telegram via the same
-`TELEGRAM_BOT_TOKEN` / `ADMIN_CHAT_IDS` used by mc-guard; successful backups stay silent.
+**`BACKUP_DIR`** defaults to `/home/vast/minecraft/backups` for bare-host cron; mc-guard sets **`BACKUP_DIR=/backups`** (from **`CREEPWATCH_BACKUP_DIR`**, default **`/backups`**) so files land in the repo’s **`./backups`** on the host. Local pruning is either **`BACKUP_MAX_ARCHIVES`** (keep newest *N* tarballs) or, if that is unset, **`BACKUP_RETENTION_DAYS`** (default **7**). Failures are reported to Telegram when **`TELEGRAM_BOT_TOKEN`** / **`ADMIN_CHAT_IDS`** are in the environment or found via **`CREEPWATCH_ENV_FILE`** (or the legacy default `.env` path).
 
-Optional systemd units ship under `systemd/` — see that directory for
-`minecraft-backup.service` and `minecraft-backup.timer`. Install once:
+### Cloudflare R2 (optional)
 
-```sh
-sudo cp systemd/minecraft-backup.service systemd/minecraft-backup.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now minecraft-backup.timer
-```
+After a successful local tarball, **`scripts/backup.sh`** can upload to **R2** with the **AWS S3 API** (via the official **`amazon/aws-cli`** image and **`docker run`**, same as the rest of the script). Set on the host **`.env`** (and pass through Compose to **`mc-guard`** — already wired in `docker-compose.yml`):
 
-Push backups off-host (S3, Backblaze, rsync to another box, …) by extending the
-script after the successful snapshot step.
+| Variable | Purpose |
+|----------|---------|
+| **`R2_S3_ENDPOINT`** | `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` (Dashboard → R2 → S3 API) |
+| **`R2_BUCKET`** | Bucket name |
+| **`R2_ACCESS_KEY_ID`** / **`R2_SECRET_ACCESS_KEY`** | R2 **S3 API** access key pair (create a token limited to this bucket) |
+| **`R2_PREFIX`** | Optional object prefix (default **`minecraft/`** if unset) |
+| **`R2_RETAIN_COUNT`** | Max objects to keep under that prefix (default **3**) |
+| **`BACKUP_MAX_ARCHIVES`** | Optional: keep only this many **local** tarballs (e.g. **3**) so disk use stays small |
+
+If R2 env is only **partly** set, the script logs a warning and skips R2. If upload fails after a good local backup, the script **exits 1** and Telegram gets a failure line. Use a **bucket-scoped** API token so a compromised server cannot touch the rest of your Cloudflare account.
+
+Optional systemd units ship under `systemd/` — see **`minecraft-backup.service`** and **`minecraft-backup.timer`**.
 
 ## Repository layout
 
@@ -318,8 +351,10 @@ bin/
 scripts/
   pre-update-check.sh
   backup.sh
+  restore.sh
   check-creepwatch-heartbeat.sh
   deploy-mc-guard.sh
+backups/                   # host bind mount for mc-guard (gitignored archives; .gitkeep only)
 data/                      # bind-mounted into mc-guard (gitignored contents)
 systemd/
 test_mc_guard_classifier.py
