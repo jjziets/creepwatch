@@ -93,6 +93,10 @@ jobs:
           script: |
             set -eux
             cd "$DEPLOY_PATH"
-            sh ./scripts/deploy-mc-guard.sh "$DEPLOY_PATH"
+            test -f docker-compose.yml
+            git fetch origin main
+            git checkout main
+            git pull --ff-only origin main
+            docker compose -f docker-compose.yml up -d --no-deps mc-guard
         env:
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
