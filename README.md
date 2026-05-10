@@ -213,6 +213,17 @@ Unix timestamp to **`/data/.creepwatch_heartbeat`** on the mc-guard bind mount.
 A host cron or external monitor can alert if the file is older than ~30 minutes
 (useful when Telegram itself is the broken channel).
 
+**Host check script:** `scripts/check-creepwatch-heartbeat.sh` exits **1** and prints a
+clear line to stderr when the timestamp file is missing or older than **1800** seconds
+(override with a second argument). Point it at the host path of `.creepwatch_heartbeat`
+next to your compose `data/` directory, then wire it into cron or systemd.
+
+**External ping (optional):** set **`CREEPWATCH_HEALTHCHECK_URL`** (e.g. a
+[Healthchecks.io](https://healthchecks.io/) ping URL) so each heartbeat also issues an
+HTTP GET. If Telegram is down but the process is alive, the file still updates; if the
+bot is wedged, neither the file nor the external ping advances — use the URL as a
+backup notification path (email/SMS from the provider) independent of Telegram.
+
 ## Backups
 
 `scripts/backup.sh` produces a nightly tarball of the Minecraft world without
@@ -250,6 +261,7 @@ bin/
 scripts/
   pre-update-check.sh
   backup.sh
+  check-creepwatch-heartbeat.sh
 data/                      # bind-mounted into mc-guard (gitignored contents)
 systemd/
 test_mc_guard_classifier.py

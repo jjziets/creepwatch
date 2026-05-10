@@ -201,6 +201,7 @@ BLOCKED_FILE  = pathlib.Path("/data/blocked_players.txt")
 PREFS_FILE    = pathlib.Path("/data/notify_prefs.json")
 HEARTBEAT_FILE = pathlib.Path("/data/.creepwatch_heartbeat")
 HEARTBEAT_INTERVAL_SEC = int(os.environ.get("CREEPWATCH_HEARTBEAT_SEC", "600"))
+HEALTHCHECK_URL = os.environ.get("CREEPWATCH_HEALTHCHECK_URL", "").strip()
 DEFAULT_PREFS = {
     "joins":     True,
     "leaves":    True,
@@ -693,6 +694,17 @@ def heartbeat_loop():
             HEARTBEAT_FILE.write_text(str(int(time.time())))
         except Exception as e:
             log.warning("heartbeat write failed: %s", e)
+        if HEALTHCHECK_URL:
+            try:
+                rh = requests.get(HEALTHCHECK_URL, timeout=15)
+                if not rh.ok:
+                    log.warning(
+                        "healthcheck URL HTTP=%s body=%s",
+                        rh.status_code,
+                        (rh.text or "")[:500],
+                    )
+            except Exception as e:
+                log.warning("healthcheck URL request failed: %s", e)
         time.sleep(max(60, HEARTBEAT_INTERVAL_SEC))
 
 

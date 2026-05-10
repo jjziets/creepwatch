@@ -17,7 +17,10 @@ jobs:
           python-version: "3.12"
 
       - name: Install tools
-        run: pip install "ruff>=0.4" requests
+        run: pip install "ruff>=0.4" requests yamllint
+
+      - name: Yamllint
+        run: yamllint docker-compose.yml .github/workflows/lint.yml
 
       - name: Ruff
         run: ruff check mc_guard.py test_mc_guard_classifier.py
@@ -29,7 +32,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y shellcheck
-          shellcheck scripts/pre-update-check.sh scripts/backup.sh bin/safe-deploy.sh
+          shellcheck scripts/pre-update-check.sh scripts/backup.sh \
+            bin/safe-deploy.sh scripts/check-creepwatch-heartbeat.sh
 
       - name: Compose config
         run: |

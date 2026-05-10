@@ -26,13 +26,14 @@ services:
       TZ: "${TZ:-UTC}"
       # Used only by /pre-update-check.sh to notify on skip
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
-      ADMIN_CHAT_IDS:    "${ADMIN_CHAT_IDS}"
+      ADMIN_CHAT_IDS: "${ADMIN_CHAT_IDS}"
     volumes:
       - minecraft_data:/data
       - ./scripts/pre-update-check.sh:/pre-update-check.sh:ro
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
-      - "com.centurylinklabs.watchtower.lifecycle.pre-update=sh /pre-update-check.sh"
+      - >-
+        com.centurylinklabs.watchtower.lifecycle.pre-update=sh /pre-update-check.sh
     networks:
       - minecraft_net
 
@@ -62,6 +63,7 @@ services:
       # For /update: set to host deploy dir and mount that path read-only below.
       - CREEPWATCH_PROJECT_DIR=${CREEPWATCH_PROJECT_DIR:-}
       - CREEPWATCH_HEARTBEAT_SEC=${CREEPWATCH_HEARTBEAT_SEC:-600}
+      - CREEPWATCH_HEALTHCHECK_URL=${CREEPWATCH_HEALTHCHECK_URL:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /usr/bin/docker:/usr/bin/docker
