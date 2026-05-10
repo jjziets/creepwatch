@@ -59,6 +59,9 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - ADMIN_CHAT_IDS=${ADMIN_CHAT_IDS}
       - TZ=${TZ:-UTC}
+      # For /update: set to host deploy dir and mount that path read-only below.
+      - CREEPWATCH_PROJECT_DIR=${CREEPWATCH_PROJECT_DIR:-}
+      - CREEPWATCH_HEARTBEAT_SEC=${CREEPWATCH_HEARTBEAT_SEC:-600}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /usr/bin/docker:/usr/bin/docker

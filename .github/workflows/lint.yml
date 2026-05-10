@@ -1,0 +1,37 @@
+name: Lint
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: pip install "ruff>=0.4" requests
+
+      - name: Ruff
+        run: ruff check mc_guard.py test_mc_guard_classifier.py
+
+      - name: Unit tests
+        run: python3 -m unittest discover -v -s . -p 'test_*.py'
+
+      - name: Shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck
+          shellcheck scripts/pre-update-check.sh scripts/backup.sh bin/safe-deploy.sh
+
+      - name: Compose config
+        run: |
+          cp .env.example .env
+          docker compose -f docker-compose.yml config -q

@@ -99,8 +99,8 @@ def rcon(cmd: str) -> str:
 
 # ── Chat bridge helpers ───────────────────────────────────────────────────────
 
-def markdown_escape(text: str) -> str:
-    """Escape the small Markdown subset Telegram legacy Markdown treats specially."""
+def md_escape(text: str) -> str:
+    """Escape Telegram legacy Markdown metacharacters in user-controlled text."""
     return (
         str(text)
         .replace("\\", "\\\\")
@@ -108,7 +108,11 @@ def markdown_escape(text: str) -> str:
         .replace("*", "\\*")
         .replace("`", "\\`")
         .replace("[", "\\[")
+        .replace("]", "\\]")
     )
+
+
+markdown_escape = md_escape  # backwards-compatible name
 
 
 def single_line(text: str, limit: int = 300) -> str:
@@ -124,7 +128,7 @@ def extract_chat(line: str):
 
 
 def format_player_chat_for_telegram(player: str, message: str) -> str:
-    return f"💬 *{markdown_escape(player)}*: {markdown_escape(single_line(message, 800))}"
+    return f"💬 *{md_escape(player)}*: {md_escape(single_line(message, 800))}"
 
 
 def build_admin_tellraw_command(admin_name: str, message: str) -> str:
@@ -142,40 +146,61 @@ def send_admin_chat_to_minecraft(chat_id: int, message: str, admin_name: str):
         return
     out = rcon(build_admin_tellraw_command(admin_name, text))
     if out and "RCON error" in out:
-        send(chat_id, f"⚠️ Could not send message to Minecraft: `{markdown_escape(out)}`")
+        send(chat_id, f"⚠️ Could not send message to Minecraft: `{md_escape(out)}`")
     else:
         log.info(f"Forwarded Telegram admin chat from {admin_name}: {text}")
 
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
 
+def _log_telegram_response(op: str, r, exc=None):
+    if exc is not None:
+        log.warning("%s request failed: %s", op, exc)
+        return
+    if r is None:
+        return
+    try:
+        data = r.json()
+    except Exception as e:
+        log.warning("%s bad JSON (HTTP %s): %s", op, r.status_code, e)
+        return
+    if not r.ok or not data.get("ok"):
+        log.warning("%s Telegram API error HTTP=%s body=%s", op, r.status_code, data)
+
+
 def send(chat_id: int, text: str, keyboard=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if keyboard:
         payload["reply_markup"] = keyboard
     try:
-        requests.post(f"{API}/sendMessage", json=payload, timeout=10)
+        r = requests.post(f"{API}/sendMessage", json=payload, timeout=10)
+        _log_telegram_response("sendMessage", r)
     except Exception as e:
-        log.warning(f"send error: {e}")
+        _log_telegram_response("sendMessage", None, e)
+
 
 def broadcast(text: str):
     for cid in ADMIN_CHAT_IDS:
         send(cid, text)
 
+
 def edit(chat_id: int, msg_id: int, text: str):
     try:
-        requests.post(f"{API}/editMessageText", json={
+        r = requests.post(f"{API}/editMessageText", json={
             "chat_id": chat_id, "message_id": msg_id,
             "text": text, "parse_mode": "Markdown",
         }, timeout=10)
+        _log_telegram_response("editMessageText", r)
     except Exception as e:
-        log.warning(f"edit error: {e}")
+        _log_telegram_response("editMessageText", None, e)
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 BLOCKED_FILE  = pathlib.Path("/data/blocked_players.txt")
 PREFS_FILE    = pathlib.Path("/data/notify_prefs.json")
+HEARTBEAT_FILE = pathlib.Path("/data/.creepwatch_heartbeat")
+HEARTBEAT_INTERVAL_SEC = int(os.environ.get("CREEPWATCH_HEARTBEAT_SEC", "600"))
 DEFAULT_PREFS = {
     "joins":     True,
     "leaves":    True,
@@ -255,6 +280,7 @@ HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
 /online · /ol — who is online right now
 /activity · /ac — last 20 join/leave events
 /status · /st — server version and player count
+/update · /up — pull latest MC image and recreate container; use /update force to override online check (needs env CREEPWATCH_PROJECT_DIR + compose mount)
 
 *Notifications*
 /settings · /se — toggle your join, leave, approval, reject, restart, error, chat alerts
@@ -267,7 +293,7 @@ Send any non-command message here and it appears in Minecraft as `[Admin]`.
 
 def cmd_whitelist(chat_id: int):
     out = rcon("whitelist list")
-    send(chat_id, f"📋 *Whitelist*\n{out}")
+    send(chat_id, f"📋 *Whitelist*\n{md_escape(out)}")
 
 def cmd_remove(chat_id: int, player: str, admin_name: str):
     if not player:
@@ -275,7 +301,8 @@ def cmd_remove(chat_id: int, player: str, admin_name: str):
         return
     out = rcon(f"whitelist remove {player}")
     log.info(f"Removed {player} by {admin_name}: {out}")
-    text = f"🚫 *{player}* removed from whitelist by {admin_name}."
+    pe, ae = md_escape(player), md_escape(admin_name)
+    text = f"🚫 *{pe}* removed from whitelist by {ae}."
     send(chat_id, text)
     notify_event("rejects", text, exclude=chat_id)
 
@@ -285,13 +312,14 @@ def cmd_approve(chat_id: int, player: str, admin_name: str):
         return
     out = rcon(f"whitelist add {player}")
     log.info(f"Approved {player} by {admin_name}: {out}")
-    text = f"✅ *{player}* added to whitelist by {admin_name}."
+    pe, ae = md_escape(player), md_escape(admin_name)
+    text = f"✅ *{pe}* added to whitelist by {ae}."
     send(chat_id, text)
     notify_event("approvals", text, exclude=chat_id)
 
 def cmd_online(chat_id: int):
     out = rcon("list")
-    send(chat_id, f"👥 *Online players*\n{out}")
+    send(chat_id, f"👥 *Online players*\n{md_escape(out)}")
 
 def cmd_activity(chat_id: int):
     try:
@@ -313,21 +341,22 @@ def cmd_activity(chat_id: int):
             try:
                 ts_utc   = datetime.datetime.fromisoformat(m.group(1)).replace(tzinfo=datetime.timezone.utc)
                 ts_local = ts_utc.astimezone(DISPLAY_TZ)
-                events.append(f"`{ts_local.strftime('%H:%M')}` {m.group(2)}")
+                events.append(f"`{ts_local.strftime('%H:%M')}` {md_escape(m.group(2))}")
             except Exception as e:
                 log.warning(f"activity parse error: {e}")
         if events:
             tz_label = DISPLAY_TZ.key if hasattr(DISPLAY_TZ, "key") else str(DISPLAY_TZ)
-            send(chat_id, f"📜 *Recent activity* ({tz_label})\n" + "\n".join(events[-20:]))
+            body = "\n".join(events[-20:])
+            send(chat_id, f"📜 *Recent activity* ({md_escape(tz_label)})\n" + body)
         else:
             send(chat_id, "📜 No recent activity found.")
     except Exception as e:
-        send(chat_id, f"Error reading logs: {e}")
+        send(chat_id, f"Error reading logs: {md_escape(str(e))}")
 
 def cmd_status(chat_id: int):
     ver  = rcon("version")
     lst  = rcon("list")
-    send(chat_id, f"🖥️ *Server status*\n{ver}\n\n{lst}")
+    send(chat_id, f"🖥️ *Server status*\n{md_escape(ver)}\n\n{md_escape(lst)}")
 
 def cmd_settings(chat_id: int):
     send(chat_id,
@@ -337,7 +366,8 @@ def cmd_settings(chat_id: int):
 def cmd_blocked(chat_id: int):
     players = blocked_list()
     if players:
-        send(chat_id, "🚫 *Blocked players*\n" + "\n".join(f"• {p}" for p in sorted(players)))
+        lines = "\n".join(f"• {md_escape(p)}" for p in sorted(players))
+        send(chat_id, "🚫 *Blocked players*\n" + lines)
     else:
         send(chat_id, "🚫 *Blocked players*\nNone yet.")
 
@@ -346,9 +376,103 @@ def cmd_unblock(chat_id: int, player: str, admin_name: str):
         send(chat_id, "Usage: /unblock `<player>`")
         return
     unblock_player(player)
-    text = f"✅ *{player}* unblocked by {admin_name}. They can request access again."
+    pe, ae = md_escape(player), md_escape(admin_name)
+    text = f"✅ *{pe}* unblocked by {ae}. They can request access again."
     send(chat_id, text)
     notify_event("approvals", text, exclude=chat_id)
+
+
+def parse_rcon_list_player_count(list_out: str) -> int:
+    m = re.search(r"There are (\d+) of a max", list_out, re.IGNORECASE)
+    return int(m.group(1)) if m else 0
+
+
+def compose_project_dir() -> str | None:
+    """Host directory mounted read-only with docker-compose.yml (for /update)."""
+    p = os.environ.get("CREEPWATCH_PROJECT_DIR", "").strip()
+    if not p:
+        return None
+    if (pathlib.Path(p) / "docker-compose.yml").is_file():
+        return p
+    return None
+
+
+def run_mc_update_job(admin_label: str, force: bool):
+    """Run in a background thread: pull + recreate minecraft."""
+    try:
+        list_out = rcon("list")
+        n = parse_rcon_list_player_count(list_out)
+        if n > 0 and not force:
+            broadcast(
+                "⛔ `/update` aborted — players still online:\n"
+                f"{md_escape(list_out)}\n\nUse `/update force` after everyone logs off."
+            )
+            return
+        project = compose_project_dir()
+        if not project:
+            broadcast(
+                "⚠️ `/update` is not configured: set environment variable "
+                "`CREEPWATCH_PROJECT_DIR` on mc-guard to the host directory that "
+                "contains `docker-compose.yml`, and mount that path read-only."
+            )
+            return
+        ae = md_escape(admin_label)
+        broadcast(f"🛑 *Manual Minecraft update* by {ae} — pulling image and recreating `minecraft`…")
+        compose = pathlib.Path(project) / "docker-compose.yml"
+        base_cmd = [
+            "docker", "compose",
+            "--project-directory", project,
+            "-f", str(compose),
+        ]
+        pull = subprocess.run(
+            base_cmd + ["pull", "minecraft"],
+            capture_output=True, text=True, timeout=900,
+        )
+        if pull.returncode != 0:
+            err = (pull.stderr or pull.stdout or "").strip()
+            broadcast(f"❌ `docker compose pull` failed:\n{md_escape(err[:2000])}")
+            return
+        up = subprocess.run(
+            base_cmd + ["up", "-d", "--no-deps", "minecraft"],
+            capture_output=True, text=True, timeout=300,
+        )
+        if up.returncode != 0:
+            err = (up.stderr or up.stdout or "").strip()
+            broadcast(f"❌ `docker compose up` failed:\n{md_escape(err[:2000])}")
+            return
+        broadcast("✅ *Manual update* — pull and recreate finished. Watch for 🟢 ready / 🆙 version lines.")
+        log.info("Manual minecraft update completed (%s)", admin_label)
+    except Exception as e:
+        log.exception("run_mc_update_job failed")
+        broadcast(f"❌ Update error: {md_escape(str(e))[:800]}")
+
+
+def cmd_update(chat_id: int, arg: str, admin_name: str):
+    parts = arg.lower().split()
+    force = "force" in parts
+    list_out = rcon("list")
+    n = parse_rcon_list_player_count(list_out)
+    if n > 0 and not force:
+        send(
+            chat_id,
+            "⛔ *Players online* — cannot update yet.\n"
+            f"{md_escape(list_out)}\n\nUse `/update force` if everyone should leave first.",
+        )
+        return
+    if not compose_project_dir():
+        send(
+            chat_id,
+            "⚠️ `/update` is not configured on this bot instance "
+            "(`CREEPWATCH_PROJECT_DIR` + compose bind mount). See README.",
+        )
+        return
+    threading.Thread(
+        target=run_mc_update_job,
+        args=(admin_name, force),
+        daemon=True,
+    ).start()
+    send(chat_id, "🕐 Update started in the background — admins get progress messages here.")
+
 
 def handle_command(chat_id: int, text: str, sender_name: str):
     parts = text.strip().split(None, 1)
@@ -366,35 +490,45 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd in ("/activity", "/ac"):         cmd_activity(chat_id)
     elif cmd in ("/status", "/st"):           cmd_status(chat_id)
     elif cmd in ("/settings", "/se"):         cmd_settings(chat_id)
+    elif cmd in ("/update", "/up"):          cmd_update(chat_id, arg, sender_name)
     else:                                     send(chat_id, "Unknown command. Try /help")
 
 
 # ── Approval flow ─────────────────────────────────────────────────────────────
 
 def send_approval_request(player: str):
+    pe = md_escape(player)
     keyboard = {"inline_keyboard": [[
-        {"text": f"✅ Allow {player}", "callback_data": f"allow:{player}"},
-        {"text": f"❌ Deny",           "callback_data": f"deny:{player}"},
+        {"text": f"✅ Allow {player}"[:60], "callback_data": f"allow:{player}"},
+        {"text": "❌ Deny", "callback_data": f"deny:{player}"},
     ]]}
     for cid in ADMIN_CHAT_IDS:
-        r = requests.post(f"{API}/sendMessage", json={
-            "chat_id": cid,
-            "text": f"🎮 *New player wants to join!*\n\nPlayer: `{player}`\n\nAllow them on the Vast Family Minecraft server?",
-            "parse_mode": "Markdown",
-            "reply_markup": keyboard,
-        }, timeout=10)
-        data = r.json()
-        if data.get("ok"):
-            pending[data["result"]["message_id"]] = player
-            log.info(f"Approval request for {player} sent to {cid}")
-        else:
-            log.error(f"Telegram error to {cid}: {data}")
+        try:
+            r = requests.post(f"{API}/sendMessage", json={
+                "chat_id": cid,
+                "text": (
+                    "🎮 *New player wants to join!*\n\n"
+                    f"Player: *{pe}*\n\n"
+                    "Allow them on the Vast Family Minecraft server?"
+                ),
+                "parse_mode": "Markdown",
+                "reply_markup": keyboard,
+            }, timeout=10)
+            data = r.json()
+            if r.ok and data.get("ok"):
+                pending[data["result"]["message_id"]] = player
+                log.info(f"Approval request for {player} sent to {cid}")
+            else:
+                _log_telegram_response("sendMessage(approval)", r)
+        except Exception as e:
+            _log_telegram_response("sendMessage(approval)", None, e)
 
 
 def poll_callbacks():
     global offset
     r = requests.get(f"{API}/getUpdates", params={"offset": offset, "timeout": 5}, timeout=10)
     if not r.ok:
+        _log_telegram_response("getUpdates", r)
         return
     for update in r.json().get("result", []):
         offset = update["update_id"] + 1
@@ -455,11 +589,13 @@ def poll_callbacks():
         if action == "allow":
             out = rcon(f"whitelist add {player}")
             log.info(f"whitelist add {player} by {admin_name}: {out}")
-            result_text = f"✅ *{player}* was allowed by {admin_name}."
+            pe, ae = md_escape(player), md_escape(admin_name)
+            result_text = f"✅ *{pe}* was allowed by {ae}."
             pref_key = "approvals"
         elif action == "deny":
             block_player(player)
-            result_text = f"❌ *{player}* was denied by {admin_name} and added to the blocked list."
+            pe, ae = md_escape(player), md_escape(admin_name)
+            result_text = f"❌ *{pe}* was denied by {ae} and added to the blocked list."
             log.info(f"Denied and blocked {player} by {admin_name}")
             pref_key = "rejects"
         else:
@@ -478,12 +614,31 @@ def poll_callbacks():
 # ── Log tailing ───────────────────────────────────────────────────────────────
 
 def tail_logs():
-    proc = subprocess.Popen(
-        ["docker", "logs", "-f", "--tail", "0", "minecraft"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-    )
-    for line in proc.stdout:
-        yield line.rstrip()
+    """Yield log lines, reconnecting when the minecraft container restarts."""
+    backoff = 5
+    while True:
+        proc = subprocess.Popen(
+            ["docker", "logs", "-f", "--tail", "0", "minecraft"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        try:
+            if proc.stdout is None:
+                log.warning("minecraft log stream has no stdout; retrying in %ss", backoff)
+                time.sleep(backoff)
+                continue
+            for line in proc.stdout:
+                yield line.rstrip()
+        finally:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        log.warning("minecraft log stream ended (container restart?); reattaching in %ss", backoff)
+        time.sleep(backoff)
 
 def extract_player(line: str):
     for pat in (LOST_CONN_RE, DISCONNECT_RE):
@@ -513,11 +668,17 @@ def check_version_and_notify():
 
     if current_version != last_version:
         version_file.write_text(current_version)
+        # Successful image update resets Watchtower skip-escalation streak (see scripts/pre-update-check.sh).
+        try:
+            pathlib.Path("/data/.creepwatch_skip_streak").write_text("0\n0\n")
+        except Exception as e:
+            log.warning("Could not reset skip streak file: %s", e)
+        lv, cv = md_escape(str(last_version or "")), md_escape(current_version)
         if last_version and last_version != "":
-            broadcast(f"🆙 *Minecraft updated!*\n\n{last_version} → *{current_version}*\n\nSend /help for commands.")
+            broadcast(f"🆙 *Minecraft updated!*\n\n{lv} → *{cv}*\n\nSend /help for commands.")
         else:
             # Very first start ever
-            broadcast(f"🛡️ Whitelist Guard *online* — Minecraft *{current_version}*\nSend /help for commands.")
+            broadcast(f"🛡️ Whitelist Guard *online* — Minecraft *{cv}*\nSend /help for commands.")
         log.info(f"Version changed: {last_version} -> {current_version}")
     else:
         log.info(f"Version unchanged ({current_version}), no notification sent.")
@@ -525,11 +686,22 @@ def check_version_and_notify():
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def heartbeat_loop():
+    """Touch a file on /data so host cron or monitoring can detect a stuck bot."""
+    while True:
+        try:
+            HEARTBEAT_FILE.write_text(str(int(time.time())))
+        except Exception as e:
+            log.warning("heartbeat write failed: %s", e)
+        time.sleep(max(60, HEARTBEAT_INTERVAL_SEC))
+
+
 def main():
     log.info("Minecraft Whitelist Guard started")
 
     # Check version in background so log tailing starts immediately
     threading.Thread(target=check_version_and_notify, daemon=False).start()
+    threading.Thread(target=heartbeat_loop, daemon=True).start()
 
     already_notified = set()
     recent_errors    = {}  # signature -> last_seen_ts
@@ -564,8 +736,8 @@ def main():
             now = time.time()
             if now - recent_errors.get(sig, 0) > ERROR_COOLDOWN:
                 recent_errors[sig] = now
-                safe = event.message.replace("`", "'")[:500]
-                notify_event("errors", f"⚠️ *Server error*\n`{safe}`")
+                safe = md_escape(event.message[:1200])
+                notify_event("errors", f"⚠️ *Server error*\n{safe}")
             continue
 
         chat = extract_chat(line)
@@ -576,12 +748,14 @@ def main():
 
         m = JOINED_RE.search(line)
         if m:
-            notify_event("joins", f"🟢 *{m.group(1)}* joined the game.")
+            name = md_escape(m.group(1))
+            notify_event("joins", f"🟢 *{name}* joined the game.")
             continue
 
         m = LEFT_RE.search(line)
         if m:
-            notify_event("leaves", f"⚪ *{m.group(1)}* left the game.")
+            name = md_escape(m.group(1))
+            notify_event("leaves", f"⚪ *{name}* left the game.")
             continue
 
         player = extract_player(line)

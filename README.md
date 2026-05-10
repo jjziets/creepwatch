@@ -25,6 +25,10 @@ in the same Compose stack.
 - **Update notifications** — broadcasts a message only when the Minecraft server version actually changes (silent on routine restarts).
 - **Log error paging** — `ERROR` lines are classified; known noisy patterns are suppressed; real issues go to Telegram with a cooldown per signature.
 - **Block list** — denied players land in a persistent blocklist so subsequent join attempts are silently ignored.
+- **Manual `/update`** — optional pull + recreate of the `minecraft` service from Telegram when the compose project is mounted into mc-guard (see below).
+- **Log-tail resilience** — mc-guard reconnects to `docker logs` after a Minecraft container restart instead of exiting.
+- **Skip escalation** — Watchtower skip streak is persisted; long runs of “players always online” escalate the wording of the heads-up message.
+- **Heartbeat file** — mc-guard refreshes `/data/.creepwatch_heartbeat` for host-side stale detection.
 
 ## Commands
 
@@ -42,6 +46,7 @@ Long form and short alias both work.
 | `/activity` | `/ac` | Last 20 join / leave / disconnect events |
 | `/status` | `/st` | Server version and player count |
 | `/settings` | `/se` | Toggle your own notification categories |
+| `/update` | `/up` | Pull latest MC image and recreate `minecraft` (optional; see README) |
 
 ## Quick start
 
@@ -137,8 +142,12 @@ subject to a per-signature cooldown before Telegram sees it.
 Unit tests live in `test_mc_guard_classifier.py`:
 
 ```sh
+pip install requests   # once, for local runs
 python3 -m unittest discover -v -s . -p 'test_*.py'
 ```
+
+GitHub Actions runs the same tests plus `ruff` and `shellcheck` on every push
+to `main` / `dev` (see `.github/workflows/lint.yml`).
 
 ## Auto-update protection
 
@@ -155,10 +164,54 @@ from under players. Admins can get one Telegram heads-up when a skip is
 notified; subsequent skip attempts within **12 hours** can stay silent thanks to
 a marker file **`.creepwatch_last_skip_notify`** on the Minecraft data volume.
 
+If skips happen on **different calendar days** in a row, a counter in
+**`.creepwatch_skip_streak`** (on the same volume) increments once per day. The
+Telegram text escalates after **3** and **7** consecutive skip days so a stale
+server version is not silent forever. A successful Minecraft version change
+(resetting that streak) is detected by mc-guard when it writes `mc_last_version`.
+
 The first idle window wins: as soon as the lobby is empty the update
 proceeds, creepwatch broadcasts the routine stopping / ready messages when those
 log lines appear, and the version-change detector adds a **Minecraft updated** line if
 a new MC version landed.
+
+## Safe compose deploys
+
+`docker compose up -d <service>` can still recreate **other** services when their
+declared config drifted, because Compose re-evaluates the whole project. That can
+restart `minecraft` when you only meant to roll `mc-guard`.
+
+Use **`bin/safe-deploy.sh`** from the compose project directory:
+
+```sh
+chmod +x bin/safe-deploy.sh
+./bin/safe-deploy.sh mc-guard
+```
+
+It checks `rcon-cli list` for online players (unless `--force`) and runs
+`docker compose up -d --no-deps <service>` so dependency drift does not cascade.
+
+## Manual `/update` from Telegram
+
+Admins can run `/update` or `/up` (and `/update force` to override the online
+player check). The bot runs `docker compose pull minecraft` then
+`docker compose up -d --no-deps minecraft` using **`CREEPWATCH_PROJECT_DIR`**
+as the host directory that contains `docker-compose.yml`.
+
+1. Set `CREEPWATCH_PROJECT_DIR` in `.env` to that absolute path (same directory
+   you run Compose from on the host).
+2. Add a **read-only** bind mount on `mc-guard` so the same files exist inside
+   the container, for example `- /home/you/minecraft:/project:ro` and set
+   `CREEPWATCH_PROJECT_DIR=/project`.
+
+Without the mount + env var, `/update` replies that it is not configured.
+
+## Liveness heartbeat
+
+Every **600** seconds (override with `CREEPWATCH_HEARTBEAT_SEC`) mc-guard writes a
+Unix timestamp to **`/data/.creepwatch_heartbeat`** on the mc-guard bind mount.
+A host cron or external monitor can alert if the file is older than ~30 minutes
+(useful when Telegram itself is the broken channel).
 
 ## Backups
 
@@ -192,6 +245,8 @@ script after the successful snapshot step.
 ```
 docker-compose.yml
 mc_guard.py
+bin/
+  safe-deploy.sh
 scripts/
   pre-update-check.sh
   backup.sh
@@ -199,6 +254,8 @@ data/                      # bind-mounted into mc-guard (gitignored contents)
 systemd/
 test_mc_guard_classifier.py
 geyser/                    # optional Bedrock bridge
+.github/workflows/
+  lint.yml
 ```
 
 Keep **`.env`**, world data, `backups/`, and runtime files out of git.

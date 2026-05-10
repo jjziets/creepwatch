@@ -4,3 +4,5 @@ geyser/config.yml
 __pycache__/
 *.pyc
 .DS_Store
+.venv/
+.venv-ci/
