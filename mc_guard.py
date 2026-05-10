@@ -6,7 +6,7 @@ Minecraft Whitelist Guard Bot
 - Slash commands for server management
 - Only notifies on actual Minecraft version updates (not routine restarts)
 """
-import subprocess, requests, time, re, logging, os, threading, pathlib, json, datetime
+import contextlib, subprocess, requests, time, re, logging, os, threading, pathlib, json, datetime
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
@@ -227,6 +227,42 @@ def send(chat_id: int, text: str, keyboard=None):
         _log_telegram_response("sendMessage", None, e)
 
 
+def send_chat_action(chat_id: int, action: str = "typing") -> None:
+    """Telegram 'typing…' (and other actions); typing expires after ~5s unless refreshed."""
+    try:
+        r = requests.post(
+            f"{API}/sendChatAction",
+            json={"chat_id": chat_id, "action": action},
+            timeout=5,
+        )
+        _log_telegram_response("sendChatAction", r)
+    except Exception as e:
+        _log_telegram_response("sendChatAction", None, e)
+
+
+def _typing_keepalive(chat_id: int, stop: threading.Event) -> None:
+    while not stop.is_set():
+        send_chat_action(chat_id, "typing")
+        if stop.wait(4.0):
+            break
+
+
+@contextlib.contextmanager
+def backup_typing_indicator(chat_id: int | None):
+    """Refresh typing indicator while a long backup runs (private admin chat only)."""
+    if chat_id is None:
+        yield
+        return
+    stop = threading.Event()
+    th = threading.Thread(target=_typing_keepalive, args=(chat_id, stop), daemon=True)
+    th.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        th.join(timeout=2)
+
+
 def broadcast(text: str):
     for cid in ADMIN_CHAT_IDS:
         send(cid, text)
@@ -341,7 +377,7 @@ HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
 /difficulty · /diff — peaceful, easy, normal, hard
 /gamerule · /gr — query or set; value must be true, false, or digits only
 /update · /up — pull latest MC image and recreate container; use /update force to override online check (needs env CREEPWATCH_PROJECT_DIR + compose mount)
-/backup — snapshot world to tarball (scheduled in-game if players are online); live stage pings in your chat when you start it
+/backup — snapshot world to tarball (scheduled if online); typing indicator + stage pings in your chat
 /restore list | last | `<filename>` — list backups, restore latest, or restore one by name (scheduled if online)
 
 *Notifications*
@@ -756,10 +792,19 @@ def run_restore_subprocess(restore_arg: str) -> subprocess.CompletedProcess:
 def _cmd_backup_worker(chat_id: int, admin_name: str):
     """Runs backup.sh with Telegram stage pings to chat_id; reports final outcome."""
     try:
-        r = run_backup_subprocess(progress_chat_id=chat_id)
+        send_chat_action(chat_id, "typing")
+        with backup_typing_indicator(chat_id):
+            r = run_backup_subprocess(progress_chat_id=chat_id)
         tail = ((r.stdout or "") + (r.stderr or "")).strip()
         tail = md_escape(tail[-1800:]) if tail else "(no script output)"
         if r.returncode != 0:
+            log.warning(
+                "backup.sh exit=%s admin=%s stderr_head=%r stdout_head=%r",
+                r.returncode,
+                admin_name,
+                (r.stderr or "")[:800],
+                (r.stdout or "")[:400],
+            )
             broadcast(f"❌ *Backup failed* (exit {r.returncode})\n{tail}")
             send(chat_id, f"❌ Backup finished with errors, exit {r.returncode}.\n{tail}")
             return
@@ -879,10 +924,18 @@ def maintenance_watcher_loop():
             ae = md_escape(admin_label)
             if kind == "backup":
                 broadcast(f"📦 *Scheduled backup* (requested by {ae}) — lobby empty, running now…")
-                r = run_backup_subprocess(progress_chat_id=req_chat)
+                send_chat_action(req_chat, "typing")
+                with backup_typing_indicator(req_chat):
+                    r = run_backup_subprocess(progress_chat_id=req_chat)
                 tail = ((r.stdout or "") + (r.stderr or "")).strip()
                 tail = md_escape(tail[-1800:]) if tail else "(no script output)"
                 if r.returncode != 0:
+                    log.warning(
+                        "scheduled backup.sh exit=%s stderr_head=%r stdout_head=%r",
+                        r.returncode,
+                        (r.stderr or "")[:800],
+                        (r.stdout or "")[:400],
+                    )
                     broadcast(f"❌ *Scheduled backup failed* (exit {r.returncode})\n{tail}")
                     send(req_chat, f"❌ Scheduled backup failed.\n{tail}")
                 else:

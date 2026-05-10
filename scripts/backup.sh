@@ -12,7 +12,8 @@
 #
 # Preflight (before save-off): minecraft container running, world level.dat on
 # the volume, and enough free disk under BACKUP_DIR. Skips backup if unhealthy.
-# Post-tar: gzip -t on the archive rejects obvious truncation/corruption.
+# Post-tar: by default `gzip -l` (header read only — safe for huge worlds). Set
+# BACKUP_STRICT_GZIP_TEST=1 to use `gzip -t` (reads entire archive; can OOM/timeout).
 #
 # Optional Cloudflare R2 (S3-compatible): set R2_BUCKET, R2_ACCESS_KEY_ID,
 # R2_SECRET_ACCESS_KEY, R2_S3_ENDPOINT (https://<accountid>.r2.cloudflarestorage.com).
@@ -63,8 +64,9 @@ if [ -f "$env_file" ]; then
     [ -z "${BACKUP_SKIP_PREFLIGHT:-}" ] && BACKUP_SKIP_PREFLIGHT=$(pluck BACKUP_SKIP_PREFLIGHT)
     [ -z "${BACKUP_MIN_FREE_MB:-}" ] && BACKUP_MIN_FREE_MB=$(pluck BACKUP_MIN_FREE_MB)
     [ -z "${BACKUP_MIN_ARCHIVE_BYTES:-}" ] && BACKUP_MIN_ARCHIVE_BYTES=$(pluck BACKUP_MIN_ARCHIVE_BYTES)
+    [ -z "${BACKUP_STRICT_GZIP_TEST:-}" ] && BACKUP_STRICT_GZIP_TEST=$(pluck BACKUP_STRICT_GZIP_TEST)
     export R2_BUCKET R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_S3_ENDPOINT R2_PREFIX R2_RETAIN_COUNT BACKUP_MAX_ARCHIVES
-    export BACKUP_SKIP_PREFLIGHT BACKUP_MIN_FREE_MB BACKUP_MIN_ARCHIVE_BYTES
+    export BACKUP_SKIP_PREFLIGHT BACKUP_MIN_FREE_MB BACKUP_MIN_ARCHIVE_BYTES BACKUP_STRICT_GZIP_TEST
 fi
 
 log() { printf '[%s backup] %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -202,11 +204,20 @@ if ! [ "$archive_bytes" -ge "$BACKUP_MIN_ARCHIVE_BYTES" ] 2>/dev/null; then
     exit 1
 fi
 
-log "postflight: gzip integrity test on $ARCHIVE_NAME"
-if ! docker_cli run --rm -v "$BACKUP_DIR":/backups:ro alpine:latest gzip -t "/backups/$ARCHIVE_NAME" 2>/dev/null; then
-    rm -f "$archive_path"
-    notify_failure "🚨 Minecraft backup rejected: gzip -t failed (truncated or corrupt tarball); file removed."
-    exit 1
+if [ -n "${BACKUP_STRICT_GZIP_TEST:-}" ]; then
+    log "postflight: gzip -t full test on $ARCHIVE_NAME (BACKUP_STRICT_GZIP_TEST)"
+    if ! docker_cli run --rm -v "$BACKUP_DIR":/backups:ro alpine:latest gzip -t "/backups/$ARCHIVE_NAME" 2>/dev/null; then
+        rm -f "$archive_path"
+        notify_failure "🚨 Minecraft backup rejected: gzip -t failed (truncated or corrupt tarball); file removed."
+        exit 1
+    fi
+else
+    log "postflight: gzip header check on $ARCHIVE_NAME (set BACKUP_STRICT_GZIP_TEST=1 for full -t)"
+    if ! docker_cli run --rm -v "$BACKUP_DIR":/backups:ro alpine:latest gzip -l "/backups/$ARCHIVE_NAME" >/dev/null 2>&1; then
+        rm -f "$archive_path"
+        notify_failure "🚨 Minecraft backup rejected: gzip header unreadable (truncated or not gzip); file removed."
+        exit 1
+    fi
 fi
 
 size=$(du -h "$archive_path" 2>/dev/null | cut -f1)

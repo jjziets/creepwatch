@@ -273,7 +273,7 @@ Without the mount + env var, `/update` and `/restore` reply that they are not co
 
 **Telegram:** Admins use **`/backup`** (alias **`/bu`**) and **`/restore list`**, **`/restore last`**, or **`/restore <filename>`** (`/rs`). If **anyone is online**, the bot **queues** the job, sends a **`tellraw @a`** heads-up in Minecraft, and runs the script automatically once **`rcon list`** shows zero players (polled about every 45 seconds). Only **one** queued maintenance job is allowed at a time. **`/update`** is blocked while a backup or restore is queued.
 
-When you run **`/backup`** with an empty server, **`backup.sh`** sends **short progress lines** to your private Telegram chat (preflight → snapshot → gzip OK → R2 if configured → finished), using the same bot token and **`BACKUP_PROGRESS_CHAT_ID`** injected by mc-guard.
+When you run **`/backup`** with an empty server, **`backup.sh`** sends **short progress lines** to your private Telegram chat (preflight → snapshot → gzip OK → R2 if configured → finished), using the same bot token and **`BACKUP_PROGRESS_CHAT_ID`** injected by mc-guard. **`mc-guard`** also calls **`sendChatAction` typing** on that chat every few seconds while the subprocess runs so Telegram shows “typing…”.
 
 **Manual update:** The background **`/update`** job runs **`scripts/backup.sh`** before **`docker compose pull`** / **`up`** when the backup script is present. If that backup fails, the update is **aborted**.
 
@@ -321,7 +321,7 @@ backup notification path (email/SMS from the provider) independent of Telegram.
 2. `rcon save-off` — pause autosave.
 3. Tar the `minecraft_data` volume from an ephemeral `alpine:latest` container (`docker run` uses **`DOCKER_REAL`** when set, as in mc-guard).
 4. `rcon save-on` — resume autosave. If the tarball succeeded but **save-on** fails, the script **exits with error**, notifies admins, and leaves the tarball in place for inspection.
-5. **Postflight**: archive must be at least **`BACKUP_MIN_ARCHIVE_BYTES`** (default **1 MiB**); then **`gzip -t`** rejects obvious truncation. Bad archives are **removed** before R2 upload.
+5. **Postflight**: archive must be at least **`BACKUP_MIN_ARCHIVE_BYTES`** (default **1 MiB**); then a quick **`gzip -l`** header read. For tiny worlds you can set **`BACKUP_STRICT_GZIP_TEST=1`** to run full **`gzip -t`** (reads the whole archive — can be slow or memory-heavy).
 
 **`BACKUP_DIR`** defaults to `/home/vast/minecraft/backups` for bare-host cron; mc-guard sets **`BACKUP_DIR=/backups`** (from **`CREEPWATCH_BACKUP_DIR`**, default **`/backups`**) so files land in the repo’s **`./backups`** on the host. Local pruning is either **`BACKUP_MAX_ARCHIVES`** (keep newest *N* tarballs) or, if that is unset, **`BACKUP_RETENTION_DAYS`** (default **7**). Failures are reported to Telegram when **`TELEGRAM_BOT_TOKEN`** / **`ADMIN_CHAT_IDS`** are in the environment or found via **`CREEPWATCH_ENV_FILE`** (or the legacy default `.env` path).
 
