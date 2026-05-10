@@ -20,6 +20,9 @@
 # objects so at most R2_RETAIN_COUNT archives remain (default 3).
 # Optional BACKUP_MAX_ARCHIVES: keep only that many newest local tarballs (else
 # prune by BACKUP_RETENTION_DAYS, default 7).
+#
+# Optional BACKUP_PROGRESS_CHAT_ID: Telegram chat id (digits only) to receive
+# short stage updates; set by mc-guard when an admin runs /backup (not from .env pluck).
 
 set -u
 
@@ -84,6 +87,19 @@ notify_failure() {
     IFS=$saved_ifs
 }
 
+# Single-chat progress (mc-guard sets BACKUP_PROGRESS_CHAT_ID for /backup).
+progress_ping() {
+    text=$1
+    [ -z "${BACKUP_PROGRESS_CHAT_ID:-}" ] && return 0
+    [ -z "${TELEGRAM_BOT_TOKEN:-}" ] && return 0
+    case "$BACKUP_PROGRESS_CHAT_ID" in *[!0-9]*) return 0 ;; esac
+    log "progress telegram: $text"
+    curl -s -m 8 -X POST \
+        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=$BACKUP_PROGRESS_CHAT_ID" \
+        --data-urlencode "text=$text" >/dev/null 2>&1 || true
+}
+
 # --- Preflight: do not touch save-off / tar if the host or volume looks bad -----
 BACKUP_MIN_FREE_MB="${BACKUP_MIN_FREE_MB:-512}"
 BACKUP_MIN_ARCHIVE_BYTES="${BACKUP_MIN_ARCHIVE_BYTES:-1048576}"
@@ -124,12 +140,16 @@ if ! preflight_backup; then
     exit 1
 fi
 
+progress_ping "📋 Preflight OK — flushing world (save-all)…"
+
 log "save-all flush"
 if ! docker_cli exec minecraft rcon-cli save-all flush >/dev/null 2>&1; then
     log "FAIL: save-all flush"
     notify_failure "🚨 Minecraft backup failed at save-all flush (RCON). Backup not created — check server logs."
     exit 1
 fi
+
+progress_ping "💾 save-all done — pausing autosave (save-off)…"
 
 log "save-off"
 if ! docker_cli exec minecraft rcon-cli save-off >/dev/null 2>&1; then
@@ -138,6 +158,8 @@ if ! docker_cli exec minecraft rcon-cli save-off >/dev/null 2>&1; then
     docker_cli exec minecraft rcon-cli save-on >/dev/null 2>&1 || true
     exit 1
 fi
+
+progress_ping "📸 Snapshotting volume → $ARCHIVE_NAME (may take several minutes)…"
 
 log "snapshotting volume to $ARCHIVE_NAME"
 backup_ok=1
@@ -190,6 +212,8 @@ fi
 size=$(du -h "$archive_path" 2>/dev/null | cut -f1)
 log "backup complete ($size)"
 
+progress_ping "✅ Local backup OK — $ARCHIVE_NAME ($size), gzip verified."
+
 # --- Optional Cloudflare R2 upload + remote retention -----------------------------
 r2_fully_configured() {
     [ -n "${R2_BUCKET:-}" ] && [ -n "${R2_ACCESS_KEY_ID:-}" ] && [ -n "${R2_SECRET_ACCESS_KEY:-}" ] && [ -n "${R2_S3_ENDPOINT:-}" ]
@@ -210,6 +234,7 @@ if r2_fully_configured; then
     R2_KEEP=${R2_RETAIN_COUNT:-3}
     r2_key=$(r2_object_key "$R2_PREFIX_NORM" "$ARCHIVE_NAME")
     log "uploading to R2 s3://$R2_BUCKET/$r2_key"
+    progress_ping "☁️ Uploading to R2…"
     if ! docker_cli run --rm \
         -e "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
         -e "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
@@ -248,6 +273,7 @@ if r2_fully_configured; then
             --endpoint-url "$R2_S3_ENDPOINT" \
             --region auto >/dev/null 2>&1 || log "WARN: R2 rm failed for $k"
     done
+    progress_ping "☁️ R2 upload and retention finished."
 else
     if [ -n "${R2_BUCKET:-}" ] || [ -n "${R2_ACCESS_KEY_ID:-}" ] || [ -n "${R2_SECRET_ACCESS_KEY:-}" ] || [ -n "${R2_S3_ENDPOINT:-}" ]; then
         log "WARN: R2 partly configured — need R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_S3_ENDPOINT; skipping R2"
@@ -269,3 +295,5 @@ else
     find "$BACKUP_DIR" -name 'minecraft-*.tar.gz' -mtime "+$RETAIN_DAYS" -delete 2>/dev/null || true
     log "pruned local backups older than $RETAIN_DAYS days"
 fi
+
+progress_ping "🏁 Backup pipeline finished — $ARCHIVE_NAME ($size)."

@@ -341,7 +341,7 @@ HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
 /difficulty · /diff — peaceful, easy, normal, hard
 /gamerule · /gr — query or set; value must be true, false, or digits only
 /update · /up — pull latest MC image and recreate container; use /update force to override online check (needs env CREEPWATCH_PROJECT_DIR + compose mount)
-/backup — snapshot world to tarball (scheduled in-game if players are online)
+/backup — snapshot world to tarball (scheduled in-game if players are online); live stage pings in your chat when you start it
 /restore list | last | `<filename>` — list backups, restore latest, or restore one by name (scheduled if online)
 
 *Notifications*
@@ -730,10 +730,13 @@ def _subprocess_env_for_backup_restore() -> dict:
     return env
 
 
-def run_backup_subprocess() -> subprocess.CompletedProcess:
+def run_backup_subprocess(progress_chat_id: int | None = None) -> subprocess.CompletedProcess:
+    env = _subprocess_env_for_backup_restore()
+    if progress_chat_id is not None:
+        env["BACKUP_PROGRESS_CHAT_ID"] = str(int(progress_chat_id))
     return subprocess.run(
         ["/bin/sh", str(BACKUP_SCRIPT)],
-        env=_subprocess_env_for_backup_restore(),
+        env=env,
         capture_output=True,
         text=True,
         timeout=7200,
@@ -750,6 +753,25 @@ def run_restore_subprocess(restore_arg: str) -> subprocess.CompletedProcess:
     )
 
 
+def _cmd_backup_worker(chat_id: int, admin_name: str):
+    """Runs backup.sh with Telegram stage pings to chat_id; reports final outcome."""
+    try:
+        r = run_backup_subprocess(progress_chat_id=chat_id)
+        tail = ((r.stdout or "") + (r.stderr or "")).strip()
+        tail = md_escape(tail[-1800:]) if tail else "(no script output)"
+        if r.returncode != 0:
+            broadcast(f"❌ *Backup failed* (exit {r.returncode})\n{tail}")
+            send(chat_id, f"❌ Backup finished with errors, exit {r.returncode}.\n{tail}")
+            return
+        broadcast("✅ *World backup* finished.")
+        send(chat_id, "✅ Backup finished successfully. See the stage messages above.")
+    except Exception as e:
+        log.exception("backup worker")
+        err = md_escape(str(e)[:800])
+        broadcast(f"❌ *Backup crashed*: {err}")
+        send(chat_id, f"❌ Backup crashed: {err}")
+
+
 def cmd_backup(chat_id: int, admin_name: str):
     if not BACKUP_SCRIPT.is_file():
         send(
@@ -764,15 +786,12 @@ def cmd_backup(chat_id: int, admin_name: str):
         send(chat_id, "📌 *Backup scheduled* — players were messaged in-game; it runs when nobody is online.")
         return
     broadcast(f"📦 *World backup* started by {md_escape(admin_name)}…")
-    r = run_backup_subprocess()
-    tail = ((r.stdout or "") + (r.stderr or "")).strip()
-    tail = md_escape(tail[-1800:]) if tail else "(no script output)"
-    if r.returncode != 0:
-        broadcast(f"❌ *Backup failed* (exit {r.returncode})\n{tail}")
-        send(chat_id, f"❌ Backup failed.\n{tail}")
-        return
-    broadcast("✅ *World backup* finished.")
-    send(chat_id, "✅ Backup finished successfully.")
+    send(
+        chat_id,
+        "🕐 *Backup running* — stage updates will appear here: preflight, snapshot, then R2 if configured. "
+        "Large worlds can take several minutes.",
+    )
+    threading.Thread(target=_cmd_backup_worker, args=(chat_id, admin_name), daemon=True).start()
 
 
 def cmd_restore(chat_id: int, arg: str, admin_name: str):
@@ -860,7 +879,7 @@ def maintenance_watcher_loop():
             ae = md_escape(admin_label)
             if kind == "backup":
                 broadcast(f"📦 *Scheduled backup* (requested by {ae}) — lobby empty, running now…")
-                r = run_backup_subprocess()
+                r = run_backup_subprocess(progress_chat_id=req_chat)
                 tail = ((r.stdout or "") + (r.stderr or "")).strip()
                 tail = md_escape(tail[-1800:]) if tail else "(no script output)"
                 if r.returncode != 0:

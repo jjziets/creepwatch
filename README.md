@@ -273,6 +273,8 @@ Without the mount + env var, `/update` and `/restore` reply that they are not co
 
 **Telegram:** Admins use **`/backup`** (alias **`/bu`**) and **`/restore list`**, **`/restore last`**, or **`/restore <filename>`** (`/rs`). If **anyone is online**, the bot **queues** the job, sends a **`tellraw @a`** heads-up in Minecraft, and runs the script automatically once **`rcon list`** shows zero players (polled about every 45 seconds). Only **one** queued maintenance job is allowed at a time. **`/update`** is blocked while a backup or restore is queued.
 
+When you run **`/backup`** with an empty server, **`backup.sh`** sends **short progress lines** to your private Telegram chat (preflight → snapshot → gzip OK → R2 if configured → finished), using the same bot token and **`BACKUP_PROGRESS_CHAT_ID`** injected by mc-guard.
+
 **Manual update:** The background **`/update`** job runs **`scripts/backup.sh`** before **`docker compose pull`** / **`up`** when the backup script is present. If that backup fails, the update is **aborted**.
 
 **Host / cron:** You can still run **`scripts/backup.sh`** from the host (set **`BACKUP_DIR`**, optional **`DOCKER_REAL`**, **`CREEPWATCH_ENV_FILE`** for Telegram failure alerts). **`scripts/restore.sh`** needs **`CREEPWATCH_PROJECT_DIR`** pointing at the compose project and **`BACKUP_DIR`**; it **`stop`s** `minecraft`, wipes the **`minecraft_data`** volume contents from a sidecar container, extracts the tarball, then **`start`s** `minecraft` again — **destructive**.
