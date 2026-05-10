@@ -48,6 +48,13 @@ Long form and short alias both work.
 | `/settings` | `/se` | Toggle your own notification categories |
 | `/update` | `/up` | Pull latest MC image and recreate `minecraft` (optional; see README) |
 
+## Security
+
+- **Admins only in private chat** — The bot ignores every update except private DMs where the sender’s Telegram **user id** is listed in `ADMIN_CHAT_IDS`. Commands, the Minecraft chat bridge, and Allow / Deny buttons are not accepted from groups, channels, or strangers (including no reply to random `/start` spam).
+- **Configure user ids, not groups** — Use the positive id from [@userinfobot](https://t.me/userinfobot) in a **private** chat with yourself. Negative ids are groups/supergroups; the bot refuses them at startup.
+- **Secrets** — `TELEGRAM_BOT_TOKEN` and the Docker socket give full power over the host stack; treat `.env` like production credentials and rotate the bot token if it leaks.
+- **Attack surface** — RCON, `docker exec`, and compose-based `/update` are as trusted as anyone who can reach this bot or shell on the host.
+
 ## Quick start
 
 1. Create a bot via [@BotFather](https://t.me/BotFather) and grab the token.

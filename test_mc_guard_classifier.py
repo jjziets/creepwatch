@@ -57,6 +57,43 @@ class ChatBridgeTest(unittest.TestCase):
         self.assertIn("hello players", command)
 
 
+class TelegramAdminLockdownTest(unittest.TestCase):
+    def test_private_listed_admin_accepted(self):
+        self.assertTrue(
+            mc_guard.telegram_allows_admin_interaction(
+                chat_type="private", chat_id=12345, from_id=12345
+            )
+        )
+
+    def test_private_non_listed_user_rejected(self):
+        self.assertFalse(
+            mc_guard.telegram_allows_admin_interaction(
+                chat_type="private", chat_id=99999, from_id=99999
+            )
+        )
+
+    def test_supergroup_rejected_even_if_user_id_matches(self):
+        self.assertFalse(
+            mc_guard.telegram_allows_admin_interaction(
+                chat_type="supergroup", chat_id=-100111, from_id=12345
+            )
+        )
+
+    def test_private_chat_id_mismatch_rejected(self):
+        self.assertFalse(
+            mc_guard.telegram_allows_admin_interaction(
+                chat_type="private", chat_id=11111, from_id=12345
+            )
+        )
+
+    def test_missing_from_rejected(self):
+        self.assertFalse(
+            mc_guard.telegram_allows_admin_interaction(
+                chat_type="private", chat_id=12345, from_id=None
+            )
+        )
+
+
 class ErrorClassifierTest(unittest.TestCase):
     def test_large_dripstone_far_chunk_is_suppressed_noise(self):
         err = (

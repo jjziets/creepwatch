@@ -17,9 +17,38 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 RCON_CMD  = ["docker", "exec", "minecraft", "rcon-cli"]
 API       = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Comma-separated Telegram chat IDs of admins who can manage the server
-# and receive notifications. Example: ADMIN_CHAT_IDS=111111,222222
-ADMIN_CHAT_IDS = [int(x) for x in os.environ["ADMIN_CHAT_IDS"].split(",") if x.strip()]
+# Comma-separated Telegram *user* ids (same number as a private DM chat id with
+# this bot from @userinfobot). Only these users may issue commands, use buttons,
+# or bridge chat. Groups/channels are ignored even if the bot were added there.
+def _parse_admin_ids(raw: str) -> list[int]:
+    ids = [int(x.strip()) for x in raw.split(",") if x.strip()]
+    if not ids:
+        raise SystemExit(
+            "ADMIN_CHAT_IDS must list at least one Telegram user id (private chat with the bot)."
+        )
+    for i in ids:
+        if i <= 0:
+            raise SystemExit(
+                "ADMIN_CHAT_IDS must be positive user ids from @userinfobot (private chat). "
+                "Do not use group or channel chat ids (they are negative or zero)."
+            )
+    return ids
+
+
+ADMIN_CHAT_IDS = _parse_admin_ids(os.environ["ADMIN_CHAT_IDS"])
+ADMIN_IDS = frozenset(ADMIN_CHAT_IDS)
+
+
+def telegram_allows_admin_interaction(*, chat_type: str | None, chat_id: int | None, from_id: int | None) -> bool:
+    """True only for a private DM with the bot where the sender is a listed admin."""
+    if chat_type != "private" or chat_id is None or from_id is None:
+        return False
+    if from_id not in ADMIN_IDS:
+        return False
+    # In a user↔bot private chat, chat id always equals the human user's id.
+    if int(chat_id) != int(from_id):
+        return False
+    return True
 
 # Display timezone for human-facing timestamps (e.g. /activity output).
 # Falls back to UTC if the named zone is missing.
@@ -534,41 +563,65 @@ def poll_callbacks():
     for update in r.json().get("result", []):
         offset = update["update_id"] + 1
 
-        # Handle Telegram messages from admins. Commands stay bot commands;
-        # normal text is bridged into Minecraft chat.
+        # Handle Telegram messages: only pre-approved admins in private DMs.
+        # Authorise on from.id (the sender), not chat.id (differs in groups/channels).
         msg = update.get("message", {})
         if msg.get("text"):
-            sender_id   = msg["chat"]["id"]
-            sender_name = msg.get("from", {}).get("first_name", str(sender_id))
-            if sender_id not in ADMIN_CHAT_IDS:
+            chat = msg.get("chat") or {}
+            from_user = msg.get("from") or {}
+            reply_chat_id = chat.get("id")
+            from_id = from_user.get("id")
+            sender_name = from_user.get("first_name", str(from_id or "unknown"))
+            if not telegram_allows_admin_interaction(
+                chat_type=chat.get("type"),
+                chat_id=reply_chat_id,
+                from_id=from_id,
+            ):
                 if msg["text"].startswith("/"):
-                    send(sender_id, "⛔ You are not authorised to manage this server.")
+                    log.info(
+                        "ignored command from non-admin chat_type=%s chat_id=%s from_id=%s",
+                        chat.get("type"),
+                        reply_chat_id,
+                        from_id,
+                    )
                 continue
             if msg["text"].startswith("/"):
-                handle_command(sender_id, msg["text"], sender_name)
+                handle_command(reply_chat_id, msg["text"], sender_name)
             else:
-                send_admin_chat_to_minecraft(sender_id, msg["text"], sender_name)
+                send_admin_chat_to_minecraft(reply_chat_id, msg["text"], sender_name)
             continue
 
-        # Handle inline button callbacks
+        # Handle inline button callbacks (same lockdown as messages).
         cb = update.get("callback_query")
         if not cb:
             continue
 
-        sender_id = cb["from"]["id"]
-        if sender_id not in ADMIN_CHAT_IDS:
-            requests.post(f"{API}/answerCallbackQuery", json={
-                "callback_query_id": cb["id"],
-                "text": "⛔ Not authorised.",
-                "show_alert": True,
-            }, timeout=10)
+        cb_msg = cb.get("message") or {}
+        cb_chat = cb_msg.get("chat") or {}
+        from_user = cb.get("from") or {}
+        from_id = from_user.get("id")
+        chat_id = cb_chat.get("id")
+        if not telegram_allows_admin_interaction(
+            chat_type=cb_chat.get("type"),
+            chat_id=chat_id,
+            from_id=from_id,
+        ):
+            requests.post(
+                f"{API}/answerCallbackQuery",
+                json={
+                    "callback_query_id": cb["id"],
+                    "text": "⛔ Not authorised.",
+                    "show_alert": True,
+                },
+                timeout=10,
+            )
             continue
 
         data       = cb["data"]
-        msg_id     = cb["message"]["message_id"]
-        chat_id    = cb["message"]["chat"]["id"]
+        msg_id     = cb_msg["message_id"]
+        sender_id = from_id
         action, _, arg = data.partition(":")
-        admin_name = cb["from"].get("first_name", str(sender_id))
+        admin_name = from_user.get("first_name", str(sender_id or "unknown"))
 
         if action == "toggle":
             new_value = None
