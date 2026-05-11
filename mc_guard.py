@@ -535,6 +535,107 @@ def cmd_msg(chat_id: int, arg: str, admin_name: str):
 
 VILLAGER_MAX_COUNT = 5
 
+# Modern (1.20.5+) component-syntax for fully-kitted tools. Note the
+# enchant id is `minecraft:sweeping_edge` since 1.21; older worlds used
+# `minecraft:sweeping`. The server here is on DataVersion 4790 (build
+# Apr 2026) which uses the renamed id.
+SWORD_BASE_ITEM = "diamond_sword"
+SWORD_ENCHANT_COMPONENT = (
+    '[minecraft:enchantments={'
+    '"minecraft:sharpness":5,'
+    '"minecraft:mending":1,'
+    '"minecraft:unbreaking":3,'
+    '"minecraft:looting":3,'
+    '"minecraft:sweeping_edge":3'
+    '}]'
+)
+SWORD_SUMMARY = (
+    "Sharpness V · Mending · Unbreaking III · Looting III · Sweeping Edge III"
+)
+
+PICKAXE_BASE_ITEM = "diamond_pickaxe"
+PICKAXE_ENCHANT_COMPONENT = (
+    '[minecraft:enchantments={'
+    '"minecraft:efficiency":5,'
+    '"minecraft:unbreaking":3,'
+    '"minecraft:mending":1,'
+    '"minecraft:fortune":3'
+    '}]'
+)
+PICKAXE_SUMMARY = "Efficiency V · Unbreaking III · Mending · Fortune III"
+
+GIVE_FAILURE_SIGNALS = (
+    "Entity not found",
+    "No entity was found",
+    "RCON error",
+    "Unknown or incomplete command",
+    "Failed to parse",
+    "Unknown enchantment",
+)
+
+
+def _give_enchanted_item(
+    chat_id: int,
+    arg: str,
+    admin_name: str,
+    *,
+    icon: str,
+    base_item: str,
+    component: str,
+    summary: str,
+    cmd_label: str,
+) -> None:
+    """Shared body for hidden admin commands that give one fully-kitted
+    item to a target player. Centralises argument validation, the
+    `give` RCON call, and Telegram formatting so each command becomes a
+    one-line wrapper. Failure signals are surfaced verbatim so a future
+    Minecraft rename of an item or enchant id is visibly loud."""
+    toks = arg.strip().split()
+    if not toks:
+        send(chat_id, f"Usage: /{cmd_label} `<player>`")
+        return
+    player = toks[0]
+    if not MC_PROFILE_NAME.match(player):
+        send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
+        return
+    give_cmd = f"give {player} {base_item}{component} 1"
+    out = rcon(give_cmd)
+    log.info("%s to %s by %s: %s", cmd_label, player, admin_name, out)
+    pe, ae = md_escape(player), md_escape(admin_name)
+    if any(sig in out for sig in GIVE_FAILURE_SIGNALS):
+        send(chat_id, f"❌ /{cmd_label} for *{pe}* failed:\n`{md_escape(out[:400])}`")
+        return
+    tail = md_escape(out) if out else "(no output)"
+    pretty_item = base_item.replace("_", " ")
+    send(
+        chat_id,
+        f"{icon} Gave *{pe}* a {pretty_item} with {summary} (by {ae}).\n`{tail}`",
+    )
+
+
+def cmd_sword(chat_id: int, arg: str, admin_name: str):
+    """Diamond sword with the melee god-roll. Hidden from /help."""
+    _give_enchanted_item(
+        chat_id, arg, admin_name,
+        icon="⚔️",
+        base_item=SWORD_BASE_ITEM,
+        component=SWORD_ENCHANT_COMPONENT,
+        summary=SWORD_SUMMARY,
+        cmd_label="sword",
+    )
+
+
+def cmd_pickaxe(chat_id: int, arg: str, admin_name: str):
+    """Diamond pickaxe with the mining god-roll. Hidden from /help."""
+    _give_enchanted_item(
+        chat_id, arg, admin_name,
+        icon="⛏️",
+        base_item=PICKAXE_BASE_ITEM,
+        component=PICKAXE_ENCHANT_COMPONENT,
+        summary=PICKAXE_SUMMARY,
+        cmd_label="pickaxe",
+    )
+
 
 def cmd_villager(chat_id: int, arg: str, admin_name: str):
     """Spawn N (1–5) villagers next to a target player. Hidden from /help.
@@ -1678,6 +1779,10 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd in ("/msg", "/tell"):            cmd_msg(chat_id, arg, sender_name)
     # /villager · /vil — admin-only, intentionally hidden from /help.
     elif cmd in ("/villager", "/vil"):        cmd_villager(chat_id, arg, sender_name)
+    # /sword · /sw — admin-only god-sword giver, also hidden from /help.
+    elif cmd in ("/sword", "/sw"):            cmd_sword(chat_id, arg, sender_name)
+    # /pickaxe · /pk — admin-only god-pickaxe giver, also hidden from /help.
+    elif cmd in ("/pickaxe", "/pk"):          cmd_pickaxe(chat_id, arg, sender_name)
     elif cmd in ("/wlreload", "/wlr"):       cmd_whitelist_reload(chat_id, arg, sender_name)
     elif cmd in ("/ban", "/bn"):             cmd_ban(chat_id, arg, sender_name)
     elif cmd in ("/banip", "/bi"):           cmd_banip(chat_id, arg, sender_name)
