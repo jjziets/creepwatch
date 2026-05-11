@@ -165,22 +165,19 @@ class ErrorClassifierTest(unittest.TestCase):
 
 
 class HiddenSwordCommandTest(unittest.TestCase):
-    """/sword (alias /sw) gives a target player a fully-kitted netherite
+    """/sword (alias /sw) gives a target player a fully-kitted diamond
     sword. Admin-only via the dispatcher gate, deliberately omitted
-    from /help. Same two contracts as /villager: dispatch works and
-    the alias does not leak into HELP_TEXT.
+    from /help.
 
-    Also sanity-checks the encoded enchantment component against a
-    known-good fragment, so a future rename (e.g. minecraft:sweeping_edge
-    flipping back, or a Sharpness cap change) raises a red flag in CI
-    instead of failing silently in-game with `Unknown enchantment`.
+    Strict-checks the encoded enchantment component against the exact
+    fragments we want, so a future rename (e.g. sweeping_edge flipping
+    back, or a Sharpness cap change) raises a red flag in CI instead of
+    failing silently in-game with `Unknown enchantment`.
     """
 
     def test_help_text_does_not_mention_sword_command(self):
         body = mc_guard.HELP_TEXT.lower()
         self.assertNotIn("/sword", body)
-        # Use word-boundary checks so future help text mentioning
-        # things like "/sw_" hypothetical doesn't trip the test.
         self.assertNotIn(" /sw ", body)
         self.assertFalse(body.rstrip().endswith("/sw"), "trailing '/sw' would reveal the alias")
 
@@ -194,15 +191,52 @@ class HiddenSwordCommandTest(unittest.TestCase):
             mc_guard.handle_command(1, "/sw Alex", "Op")
             spy.assert_called_once_with(1, "Alex", "Op")
 
+    def test_base_item_is_diamond_sword(self):
+        # We pick diamond over netherite per product spec — netherite
+        # would be one tier above and a separate balance decision.
+        self.assertEqual("diamond_sword", mc_guard.SWORD_BASE_ITEM)
+
     def test_enchantment_component_contains_expected_set(self):
         comp = mc_guard.SWORD_ENCHANT_COMPONENT
-        # Five enchantments, with the values we actually want. A typo
-        # in the IDs would fail in-game silently — keep this strict.
         self.assertIn('"minecraft:sharpness":5', comp)
         self.assertIn('"minecraft:mending":1', comp)
         self.assertIn('"minecraft:unbreaking":3', comp)
         self.assertIn('"minecraft:looting":3', comp)
         self.assertIn('"minecraft:sweeping_edge":3', comp)
+        self.assertTrue(comp.startswith("[minecraft:enchantments={"))
+        self.assertTrue(comp.endswith("}]"))
+
+
+class HiddenPickaxeCommandTest(unittest.TestCase):
+    """/pickaxe (alias /pk) gives a target player a fully-kitted diamond
+    pickaxe (Efficiency V · Unbreaking III · Mending · Fortune III).
+    Same hidden-from-/help contract as /sword and /villager."""
+
+    def test_help_text_does_not_mention_pickaxe_command(self):
+        body = mc_guard.HELP_TEXT.lower()
+        self.assertNotIn("/pickaxe", body)
+        self.assertNotIn(" /pk ", body)
+        self.assertFalse(body.rstrip().endswith("/pk"), "trailing '/pk' would reveal the alias")
+
+    def test_dispatcher_invokes_cmd_pickaxe(self):
+        with patch.object(mc_guard, "cmd_pickaxe") as spy:
+            mc_guard.handle_command(1, "/pickaxe Steve", "Op")
+            spy.assert_called_once_with(1, "Steve", "Op")
+
+    def test_dispatcher_invokes_cmd_pickaxe_via_alias(self):
+        with patch.object(mc_guard, "cmd_pickaxe") as spy:
+            mc_guard.handle_command(1, "/pk Alex", "Op")
+            spy.assert_called_once_with(1, "Alex", "Op")
+
+    def test_base_item_is_diamond_pickaxe(self):
+        self.assertEqual("diamond_pickaxe", mc_guard.PICKAXE_BASE_ITEM)
+
+    def test_enchantment_component_contains_expected_set(self):
+        comp = mc_guard.PICKAXE_ENCHANT_COMPONENT
+        self.assertIn('"minecraft:efficiency":5', comp)
+        self.assertIn('"minecraft:unbreaking":3', comp)
+        self.assertIn('"minecraft:mending":1', comp)
+        self.assertIn('"minecraft:fortune":3', comp)
         self.assertTrue(comp.startswith("[minecraft:enchantments={"))
         self.assertTrue(comp.endswith("}]"))
 
