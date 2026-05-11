@@ -164,6 +164,39 @@ class ErrorClassifierTest(unittest.TestCase):
         self.assertEqual("error", event.kind)
 
 
+class HiddenVillagerCommandTest(unittest.TestCase):
+    """/villager is admin-only and not advertised in /help. Two contracts:
+
+    1. The dispatcher routes /villager and /vil to cmd_villager — i.e.
+       the command actually works for admins who know the name.
+    2. The string "/villager" and "/vil" do not appear in HELP_TEXT —
+       i.e. it stays hidden even if someone later adds an unrelated
+       help line that happens to mention villagers.
+    """
+
+    def test_help_text_does_not_mention_villager_command(self):
+        body = mc_guard.HELP_TEXT.lower()
+        # The /command form is the only thing that matters — narrative
+        # references to "villager" elsewhere would be fine. There aren't
+        # any today.
+        self.assertNotIn("/villager", body)
+        self.assertNotIn("/vil ", body)
+        self.assertFalse(
+            body.rstrip().endswith("/vil"),
+            "trailing '/vil' would reveal the hidden alias",
+        )
+
+    def test_dispatcher_invokes_cmd_villager(self):
+        with patch.object(mc_guard, "cmd_villager") as spy:
+            mc_guard.handle_command(1, "/villager Steve 3", "Op")
+            spy.assert_called_once_with(1, "Steve 3", "Op")
+
+    def test_dispatcher_invokes_cmd_villager_via_alias(self):
+        with patch.object(mc_guard, "cmd_villager") as spy:
+            mc_guard.handle_command(1, "/vil Alex", "Op")
+            spy.assert_called_once_with(1, "Alex", "Op")
+
+
 class R2IndicatorTest(unittest.TestCase):
     """The /restore listings show whether each archive is mirrored to R2.
     The indicator function and the cache invalidator are pure, so we can
