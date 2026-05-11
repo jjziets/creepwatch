@@ -191,10 +191,10 @@ class HiddenSwordCommandTest(unittest.TestCase):
             mc_guard.handle_command(1, "/sw Alex", "Op")
             spy.assert_called_once_with(1, "Alex", "Op")
 
-    def test_base_item_is_diamond_sword(self):
-        # We pick diamond over netherite per product spec — netherite
-        # would be one tier above and a separate balance decision.
-        self.assertEqual("diamond_sword", mc_guard.SWORD_BASE_ITEM)
+    def test_base_item_is_netherite_sword(self):
+        # Netherite is the top melee tier — chosen to make this hidden
+        # admin "god roll" command feel actually god-like in play.
+        self.assertEqual("netherite_sword", mc_guard.SWORD_BASE_ITEM)
 
     def test_enchantment_component_contains_expected_set(self):
         comp = mc_guard.SWORD_ENCHANT_COMPONENT
@@ -228,8 +228,8 @@ class HiddenPickaxeCommandTest(unittest.TestCase):
             mc_guard.handle_command(1, "/pk Alex", "Op")
             spy.assert_called_once_with(1, "Alex", "Op")
 
-    def test_base_item_is_diamond_pickaxe(self):
-        self.assertEqual("diamond_pickaxe", mc_guard.PICKAXE_BASE_ITEM)
+    def test_base_item_is_netherite_pickaxe(self):
+        self.assertEqual("netherite_pickaxe", mc_guard.PICKAXE_BASE_ITEM)
 
     def test_enchantment_component_contains_expected_set(self):
         comp = mc_guard.PICKAXE_ENCHANT_COMPONENT
