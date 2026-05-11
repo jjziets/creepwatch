@@ -390,7 +390,7 @@ HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
 /time · /weather · /difficulty · /gamerule
 /backup — snapshot world (live step board in your chat; queued if anyone is online)
 /restore slots — show slot 1–3 (24h gap rule)
-/restore last`|`1`|`2`|`3`|`<file>` — restore (always takes pre-restore safety snapshot first)
+/restore `last` · `1` · `2` · `3` · `<file>` — restore (always takes pre-restore safety snapshot first)
 /update `[force]` — pull latest MC image and recreate (auto pre-update backup)
 
 *Diagnostics*

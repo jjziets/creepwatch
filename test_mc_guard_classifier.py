@@ -164,6 +164,43 @@ class ErrorClassifierTest(unittest.TestCase):
         self.assertEqual("error", event.kind)
 
 
+class HelpTextMarkdownTest(unittest.TestCase):
+    """HELP_TEXT is sent with parse_mode=Markdown. A single unbalanced
+    entity (backtick, asterisk, or square bracket) makes Telegram reject
+    the whole message with HTTP 400, silently breaking every /help and /h
+    reply. This bit production on 2026-05-11 — the slimmed HELP_TEXT had
+    an odd backtick count on the /restore line. These parity checks would
+    have failed in CI and stopped the bad deploy."""
+
+    def test_help_text_has_balanced_code_spans(self):
+        ticks = mc_guard.HELP_TEXT.count("`")
+        self.assertEqual(
+            ticks % 2,
+            0,
+            f"HELP_TEXT has {ticks} backticks (odd parity) — code spans "
+            "are unbalanced and Telegram will reject /help with HTTP 400.",
+        )
+
+    def test_help_text_has_balanced_bold(self):
+        stars = mc_guard.HELP_TEXT.count("*")
+        self.assertEqual(
+            stars % 2,
+            0,
+            f"HELP_TEXT has {stars} asterisks (odd parity) — bold spans "
+            "are unbalanced and Telegram will reject /help with HTTP 400.",
+        )
+
+    def test_help_text_has_balanced_brackets(self):
+        # Square brackets are link syntax in Markdown; mismatched counts
+        # cause parser fallback weirdness even when the message is
+        # otherwise valid.
+        self.assertEqual(
+            mc_guard.HELP_TEXT.count("["),
+            mc_guard.HELP_TEXT.count("]"),
+            "HELP_TEXT has unbalanced [ vs ] counts.",
+        )
+
+
 class SlotPickerTest(unittest.TestCase):
     """The 24h-gap slot picker is what stops same-day repeat /backup runs
     from evicting day-1 / day-2 anchors. Both backup retention (when R2
