@@ -539,7 +539,7 @@ VILLAGER_MAX_COUNT = 5
 # enchant id is `minecraft:sweeping_edge` since 1.21; older worlds used
 # `minecraft:sweeping`. The server here is on DataVersion 4790 (build
 # Apr 2026) which uses the renamed id.
-SWORD_BASE_ITEM = "diamond_sword"
+SWORD_BASE_ITEM = "netherite_sword"
 SWORD_ENCHANT_COMPONENT = (
     '[minecraft:enchantments={'
     '"minecraft:sharpness":5,'
@@ -553,7 +553,7 @@ SWORD_SUMMARY = (
     "Sharpness V · Mending · Unbreaking III · Looting III · Sweeping Edge III"
 )
 
-PICKAXE_BASE_ITEM = "diamond_pickaxe"
+PICKAXE_BASE_ITEM = "netherite_pickaxe"
 PICKAXE_ENCHANT_COMPONENT = (
     '[minecraft:enchantments={'
     '"minecraft:efficiency":5,'
