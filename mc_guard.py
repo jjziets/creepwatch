@@ -533,6 +533,66 @@ def cmd_msg(chat_id: int, arg: str, admin_name: str):
     notify_event("approvals", text, exclude=chat_id)
 
 
+VILLAGER_MAX_COUNT = 5
+
+
+def cmd_villager(chat_id: int, arg: str, admin_name: str):
+    """Spawn N (1–5) villagers next to a target player. Hidden from /help.
+
+    Intentionally not advertised in HELP_TEXT — admins only learn it from
+    out-of-band channels. Still admin-gated by the dispatcher, so the
+    only thing "hidden" buys us is keeping the command list short for
+    everyone else.
+
+    Implementation note: vanilla Java edition Minecraft. The
+    `execute at <player> run summon villager ~ ~ ~` form anchors at the
+    target's position so the spawned mob appears in their face.
+    """
+    toks = arg.strip().split(None, 1)
+    if not toks or not toks[0]:
+        send(chat_id, "Usage: /villager `<player>` `[count]` (count 1–5)")
+        return
+    player = toks[0]
+    if not MC_PROFILE_NAME.match(player):
+        send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
+        return
+    count = 1
+    if len(toks) > 1 and toks[1].strip():
+        try:
+            count = int(toks[1].strip())
+        except ValueError:
+            send(chat_id, f"Count must be a whole number 1–{VILLAGER_MAX_COUNT}.")
+            return
+        if count < 1 or count > VILLAGER_MAX_COUNT:
+            send(chat_id, f"Count must be between 1 and {VILLAGER_MAX_COUNT}.")
+            return
+
+    # Each `summon` is a separate RCON call. We surface the LAST RCON
+    # response (they're all near-identical for success cases) and bail
+    # on the first failure so the operator doesn't see "Spawned 5" when
+    # only 2 actually landed.
+    last_out = ""
+    for i in range(count):
+        out = rcon(f"execute at {player} run summon villager ~ ~ ~")
+        last_out = out
+        # rcon() returns the message body on failure too, so detect the
+        # "Entity not found" / "No entity was found" cases by content.
+        if "Entity not found" in out or "No entity was found" in out or "RCON error" in out:
+            log.warning("villager spawn aborted at %d/%d near %s by %s: %s",
+                        i + 1, count, player, admin_name, out)
+            pe, ae = md_escape(player), md_escape(admin_name)
+            send(
+                chat_id,
+                f"❌ Spawn aborted at {i}/{count} for *{pe}* (by {ae}).\n"
+                f"`{md_escape(out[:300])}`",
+            )
+            return
+    log.info("villager spawn %d near %s by %s: %s", count, player, admin_name, last_out)
+    pe, ae = md_escape(player), md_escape(admin_name)
+    tail = md_escape(last_out) if last_out else "(no output)"
+    send(chat_id, f"🧙 Spawned {count} villager(s) next to *{pe}* (by {ae}).\n`{tail}`")
+
+
 def cmd_whitelist_reload(chat_id: int, arg: str, admin_name: str):
     if arg.strip():
         send(chat_id, "Usage: /wlreload (no arguments)")
@@ -1616,6 +1676,8 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd in ("/status", "/st"):           cmd_status(chat_id)
     elif cmd in ("/kick", "/k"):              cmd_kick(chat_id, arg, sender_name)
     elif cmd in ("/msg", "/tell"):            cmd_msg(chat_id, arg, sender_name)
+    # /villager · /vil — admin-only, intentionally hidden from /help.
+    elif cmd in ("/villager", "/vil"):        cmd_villager(chat_id, arg, sender_name)
     elif cmd in ("/wlreload", "/wlr"):       cmd_whitelist_reload(chat_id, arg, sender_name)
     elif cmd in ("/ban", "/bn"):             cmd_ban(chat_id, arg, sender_name)
     elif cmd in ("/banip", "/bi"):           cmd_banip(chat_id, arg, sender_name)
