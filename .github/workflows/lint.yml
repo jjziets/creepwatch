@@ -45,12 +45,58 @@ jobs:
           cp .env.example .env
           docker compose -f docker-compose.yml config -q
 
+  # Boot mc-guard alone against the example env and confirm the Python
+  # process reaches its "Whitelist Guard started" log line. Catches issues
+  # that `compose config -q` cannot — missing bind mounts (e.g. forgetting
+  # to add progress_board.py), import errors, and any startup exception
+  # before the main loop. Runs without the minecraft container; mc-guard
+  # tolerates a missing minecraft via its retry loops.
+  smoketest_mc_guard:
+    name: mc-guard startup smoketest
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Stage example env for compose
+        run: cp .env.example .env
+
+      - name: Boot mc-guard (no deps, no minecraft)
+        run: docker compose -f docker-compose.yml up -d --no-deps mc-guard
+
+      - name: Wait for "Minecraft Whitelist Guard started"
+        run: |
+          set -eu
+          deadline=$((SECONDS + 90))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            logs=$(docker logs mc-guard 2>&1 || true)
+            if printf '%s' "$logs" | grep -q "Minecraft Whitelist Guard started"; then
+              echo "OK: mc-guard reached main()."
+              exit 0
+            fi
+            # Bail out as soon as we see an uncaught exception. Otherwise
+            # the polite 90s timeout makes failures slow to diagnose.
+            if printf '%s' "$logs" | grep -E "Traceback|ModuleNotFoundError|ImportError" >/dev/null; then
+              echo "FAIL: mc-guard reported a startup exception:" >&2
+              printf '%s\n' "$logs" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "TIMEOUT: mc-guard did not log the startup marker within 90s." >&2
+          docker logs mc-guard >&2 || true
+          exit 1
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f docker-compose.yml down --remove-orphans
+
   # After merge to main: rsync this checkout to DEPLOY_PATH, then recreate mc-guard only.
   # Secrets: DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY, DEPLOY_PATH; optional DEPLOY_PORT.
   # Do not use secrets.* in job-level `if` (invalid).
   deploy_mc_guard:
     name: Deploy mc-guard (SSH)
-    needs: lint
+    needs: [lint, smoketest_mc_guard]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     concurrency:
@@ -125,6 +171,22 @@ jobs:
             set -eux
             cd "$DEPLOY_PATH"
             test -f docker-compose.yml
-            docker compose -f docker-compose.yml up -d --no-deps mc-guard
+            # --force-recreate so deploys with only bind-mounted code
+            # changes (mc_guard.py, progress_board.py) actually restart the
+            # Python process. Without it `compose up -d` is a no-op when
+            # nothing in the compose definition changed, and the running
+            # process keeps holding the previous version in memory.
+            docker compose -f docker-compose.yml up -d --no-deps --force-recreate mc-guard
+            # Wait for the new process to reach main() before claiming success.
+            for i in $(seq 1 60); do
+              if docker logs --since 30s mc-guard 2>&1 | grep -q "Minecraft Whitelist Guard started"; then
+                echo "mc-guard back up after ${i}s"
+                exit 0
+              fi
+              sleep 1
+            done
+            echo "mc-guard did not log startup marker within 60s after recreate" >&2
+            docker logs --tail 50 mc-guard >&2 || true
+            exit 1
         env:
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
