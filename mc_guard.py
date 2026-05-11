@@ -900,6 +900,108 @@ def pick_slot_archives(
     return picks
 
 
+# ── R2 mirror listing for /restore status indicator ──────────────────────────
+# Listing is much more frequent than uploading (every /restore list or
+# /restore slots calls it), so we use boto3 for sub-second S3 calls and
+# cache for a short window — back-to-back commands reuse the listing.
+# Upload/restore themselves still go through aws-cli-in-docker (in the
+# shell scripts) to keep them self-contained for host/cron use.
+try:
+    import boto3 as _boto3
+    from botocore.config import Config as _BotoConfig
+except ImportError:  # pragma: no cover — boto3 missing only matters in prod.
+    _boto3 = None
+    _BotoConfig = None
+
+R2_LIST_CACHE_TTL = 30.0
+_r2_list_cache: tuple[float, frozenset[str] | None] = (0.0, None)
+_r2_list_cache_lock = threading.Lock()
+
+
+def _r2_s3_client():
+    """Return a boto3 S3 client for R2, or None if R2 isn't configured."""
+    if _boto3 is None:
+        return None
+    akid = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
+    sec = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
+    endpoint = os.environ.get("R2_S3_ENDPOINT", "").strip()
+    if not (akid and sec and endpoint):
+        return None
+    return _boto3.client(
+        "s3",
+        aws_access_key_id=akid,
+        aws_secret_access_key=sec,
+        endpoint_url=endpoint,
+        region_name="auto",
+        config=_BotoConfig(
+            retries={"max_attempts": 2, "mode": "standard"},
+            connect_timeout=5,
+            read_timeout=15,
+        ),
+    )
+
+
+def r2_list_basenames(force: bool = False) -> frozenset[str] | None:
+    """Return the set of `minecraft-*.tar.gz` basenames in the R2 bucket under R2_PREFIX.
+
+    Returns None when R2 is not configured or the listing fails (network,
+    auth, missing bucket). Callers should treat None as "status unknown"
+    rather than "definitely not on R2" — we don't want to mark every
+    archive as local-only just because R2 had a hiccup.
+
+    `force=True` bypasses and refreshes the cache; mc-guard uses it after
+    a successful /backup so the next /restore list reflects the upload.
+    """
+    global _r2_list_cache
+    now = time.monotonic()
+    if not force:
+        with _r2_list_cache_lock:
+            ts, cached = _r2_list_cache
+            if cached is not None and (now - ts) < R2_LIST_CACHE_TTL:
+                return cached
+
+    cli = _r2_s3_client()
+    bucket = os.environ.get("R2_BUCKET", "").strip()
+    if cli is None or not bucket:
+        with _r2_list_cache_lock:
+            _r2_list_cache = (now, None)
+        return None
+    prefix = os.environ.get("R2_PREFIX", "minecraft/").strip() or "minecraft/"
+
+    try:
+        names: set[str] = set()
+        paginator = cli.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []) or []:
+                # Key is the full prefix path, e.g. "minecraft/minecraft-…tar.gz".
+                bn = obj["Key"].rsplit("/", 1)[-1]
+                if BACKUP_ARCHIVE_RE.fullmatch(bn):
+                    names.add(bn)
+        frozen = frozenset(names)
+        with _r2_list_cache_lock:
+            _r2_list_cache = (now, frozen)
+        return frozen
+    except Exception as e:
+        log.warning("r2_list_basenames failed (%s); next /restore list will retry", e)
+        # Don't poison the cache with a stale-good value, but also don't
+        # spam R2 — short TTL on the None entry covers brief outages.
+        with _r2_list_cache_lock:
+            _r2_list_cache = (now, None)
+        return None
+
+
+def r2_indicator_for(basename: str, remote: frozenset[str] | None) -> str:
+    """Return the per-archive status emoji.
+
+    - ✅ when the archive is also on R2 (mirrored)
+    - 📍 when it exists locally but is not on R2 yet (or was pruned remotely)
+    - empty when R2 is not configured or unreachable (we don't pretend to know)
+    """
+    if remote is None:
+        return ""
+    return "✅" if basename in remote else "📍"
+
+
 def sorted_backup_basenames() -> list[str]:
     """Newest-first minecraft-*.tar.gz basenames under BACKUP_DIR."""
     if not BACKUP_DIR.is_dir():
@@ -1079,6 +1181,10 @@ def _cmd_backup_worker(chat_id: int, admin_name: str):
             broadcast(f"❌ *Backup failed* (exit {r.returncode}) — see /logs backup")
             send(chat_id, f"❌ *Backup failed*, exit {r.returncode}.\n{_format_failure_tail(r)}")
             return
+        # Refresh the cached R2 listing so the next /restore list shows the
+        # archive we just uploaded — and any old archives we just pruned —
+        # without waiting out the 30s TTL.
+        r2_list_basenames(force=True)
         broadcast("✅ *World backup* finished.")
     except Exception as e:
         log.exception("backup worker")
@@ -1225,6 +1331,7 @@ def cmd_restore(chat_id: int, arg: str, admin_name: str):
     sub = parts[0]
     if sub.lower() == "slots":
         slots = pick_slot_archives(sorted_backup_basenames())
+        remote = r2_list_basenames()
         lines = []
         for i in range(1, SLOT_COUNT + 1):
             tag = " (newest)" if i == 1 else ""
@@ -1232,14 +1339,22 @@ def cmd_restore(chat_id: int, arg: str, admin_name: str):
                 bn = slots[i - 1]
                 ts = _archive_basename_to_utc(bn)
                 ts_str = ts.strftime("%Y-%m-%d %H:%M:%S UTC") if ts else "(unparseable timestamp)"
-                lines.append(f"Slot {i}{tag}: `{md_escape(bn)}` — {md_escape(ts_str)}")
+                ind = r2_indicator_for(bn, remote)
+                ind_prefix = f"{ind} " if ind else ""
+                lines.append(f"Slot {i}{tag}: {ind_prefix}`{md_escape(bn)}` — {md_escape(ts_str)}")
             else:
                 lines.append(f"Slot {i}{tag}: (no backup ≥24h older than slot {i - 1 or 1})")
+        footer = (
+            "\n\n✅ = on R2 · 📍 = local only"
+            if remote is not None
+            else "\n\n(R2 mirror status: not configured or bucket unreachable)"
+        )
         send(
             chat_id,
             "📂 *Restore slots* (slots 2/3 require ≥24h gap)\n"
             + "\n".join(lines)
-            + "\nUse `/restore 1`–`3`, `/restore last`, or `/restore <filename>`.",
+            + "\nUse `/restore 1`–`3`, `/restore last`, or `/restore <filename>`."
+            + footer,
         )
         return
 
@@ -1255,12 +1370,23 @@ def cmd_restore(chat_id: int, arg: str, admin_name: str):
         if not names:
             send(chat_id, "📂 No `minecraft-*.tar.gz` backups in the backup directory yet.")
             return
-        body = "\n".join(f"`{md_escape(n)}`" for n in names[:25])
+        remote = r2_list_basenames()
+        rendered = []
+        for n in names[:25]:
+            ind = r2_indicator_for(n, remote)
+            rendered.append(f"{ind + ' ' if ind else ''}`{md_escape(n)}`")
+        body = "\n".join(rendered)
         more = "\n…" if len(names) > 25 else ""
+        footer = (
+            "\n\n✅ = on R2 · 📍 = local only"
+            if remote is not None
+            else "\n\n(R2 mirror status: not configured or bucket unreachable)"
+        )
         send(
             chat_id,
             f"📂 *Backups* (newest first)\n{body}{more}\n"
-            "See `/restore slots` for slots `1`–`3` with UTC times.",
+            "See `/restore slots` for slots `1`–`3` with UTC times."
+            + footer,
         )
         return
 
@@ -1345,6 +1471,7 @@ def maintenance_watcher_loop():
                     broadcast(f"❌ *Scheduled backup failed* (exit {r.returncode}) — see /logs backup")
                     send(req_chat, f"❌ Scheduled backup failed.\n{_format_failure_tail(r)}")
                 else:
+                    r2_list_basenames(force=True)
                     broadcast("✅ *Scheduled backup* finished.")
             else:
                 spec = job.get("restore") or "last"

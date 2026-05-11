@@ -99,7 +99,10 @@ services:
       - -c
       - |
         export PATH="/usr/local/bin:/usr/bin:/bin" DOCKER_REAL=/usr/bin/docker.real
-        pip install requests tzdata -q
+        # boto3 powers the R2-mirror indicator in /restore slots and /restore list.
+        # Upload/restore themselves still go through aws-cli-in-docker to keep
+        # the shell scripts self-contained for host/cron use.
+        pip install requests tzdata boto3 -q
         python /app/mc_guard.py
     depends_on:
       - minecraft
