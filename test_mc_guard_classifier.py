@@ -164,6 +164,47 @@ class ErrorClassifierTest(unittest.TestCase):
         self.assertEqual("error", event.kind)
 
 
+class R2IndicatorTest(unittest.TestCase):
+    """The /restore listings show whether each archive is mirrored to R2.
+    The indicator function and the cache invalidator are pure, so we can
+    test them without an R2 client. The boto3-backed listing is exercised
+    indirectly via the cache contract."""
+
+    def test_indicator_empty_when_remote_unknown(self):
+        # None means "R2 not configured or listing failed". We do not
+        # downgrade every archive to local-only just because R2 hiccupped.
+        self.assertEqual("", mc_guard.r2_indicator_for("anything.tar.gz", None))
+
+    def test_indicator_green_check_for_mirrored_archive(self):
+        remote = frozenset({"minecraft-20260511T040000Z.tar.gz"})
+        self.assertEqual(
+            "✅",
+            mc_guard.r2_indicator_for("minecraft-20260511T040000Z.tar.gz", remote),
+        )
+
+    def test_indicator_pin_for_local_only_archive(self):
+        remote = frozenset({"minecraft-20260510T040000Z.tar.gz"})
+        self.assertEqual(
+            "📍",
+            mc_guard.r2_indicator_for("minecraft-20260511T040000Z.tar.gz", remote),
+        )
+
+    def test_r2_list_returns_none_when_not_configured(self):
+        # Empty R2 env vars should short-circuit before any network call.
+        with patch.dict(
+            os.environ,
+            {
+                "R2_BUCKET": "",
+                "R2_ACCESS_KEY_ID": "",
+                "R2_SECRET_ACCESS_KEY": "",
+                "R2_S3_ENDPOINT": "",
+            },
+            clear=False,
+        ):
+            mc_guard._r2_list_cache = (0.0, None)
+            self.assertIsNone(mc_guard.r2_list_basenames(force=True))
+
+
 class HelpTextMarkdownTest(unittest.TestCase):
     """HELP_TEXT is sent with parse_mode=Markdown. A single unbalanced
     entity (backtick, asterisk, or square bracket) makes Telegram reject
