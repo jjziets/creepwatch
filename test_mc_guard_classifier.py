@@ -164,6 +164,49 @@ class ErrorClassifierTest(unittest.TestCase):
         self.assertEqual("error", event.kind)
 
 
+class HiddenSwordCommandTest(unittest.TestCase):
+    """/sword (alias /sw) gives a target player a fully-kitted netherite
+    sword. Admin-only via the dispatcher gate, deliberately omitted
+    from /help. Same two contracts as /villager: dispatch works and
+    the alias does not leak into HELP_TEXT.
+
+    Also sanity-checks the encoded enchantment component against a
+    known-good fragment, so a future rename (e.g. minecraft:sweeping_edge
+    flipping back, or a Sharpness cap change) raises a red flag in CI
+    instead of failing silently in-game with `Unknown enchantment`.
+    """
+
+    def test_help_text_does_not_mention_sword_command(self):
+        body = mc_guard.HELP_TEXT.lower()
+        self.assertNotIn("/sword", body)
+        # Use word-boundary checks so future help text mentioning
+        # things like "/sw_" hypothetical doesn't trip the test.
+        self.assertNotIn(" /sw ", body)
+        self.assertFalse(body.rstrip().endswith("/sw"), "trailing '/sw' would reveal the alias")
+
+    def test_dispatcher_invokes_cmd_sword(self):
+        with patch.object(mc_guard, "cmd_sword") as spy:
+            mc_guard.handle_command(1, "/sword Steve", "Op")
+            spy.assert_called_once_with(1, "Steve", "Op")
+
+    def test_dispatcher_invokes_cmd_sword_via_alias(self):
+        with patch.object(mc_guard, "cmd_sword") as spy:
+            mc_guard.handle_command(1, "/sw Alex", "Op")
+            spy.assert_called_once_with(1, "Alex", "Op")
+
+    def test_enchantment_component_contains_expected_set(self):
+        comp = mc_guard.SWORD_ENCHANT_COMPONENT
+        # Five enchantments, with the values we actually want. A typo
+        # in the IDs would fail in-game silently — keep this strict.
+        self.assertIn('"minecraft:sharpness":5', comp)
+        self.assertIn('"minecraft:mending":1', comp)
+        self.assertIn('"minecraft:unbreaking":3', comp)
+        self.assertIn('"minecraft:looting":3', comp)
+        self.assertIn('"minecraft:sweeping_edge":3', comp)
+        self.assertTrue(comp.startswith("[minecraft:enchantments={"))
+        self.assertTrue(comp.endswith("}]"))
+
+
 class HiddenVillagerCommandTest(unittest.TestCase):
     """/villager is admin-only and not advertised in /help. Two contracts:
 

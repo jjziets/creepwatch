@@ -535,6 +535,59 @@ def cmd_msg(chat_id: int, arg: str, admin_name: str):
 
 VILLAGER_MAX_COUNT = 5
 
+# Modern (1.20.5+) component-syntax for a fully-kitted melee sword. Note
+# the enchant id is `minecraft:sweeping_edge` since 1.21; older worlds
+# used `minecraft:sweeping`. The server here is on DataVersion 4790
+# (build Apr 2026) which uses the renamed id.
+SWORD_ENCHANT_COMPONENT = (
+    '[minecraft:enchantments={'
+    '"minecraft:sharpness":5,'
+    '"minecraft:mending":1,'
+    '"minecraft:unbreaking":3,'
+    '"minecraft:looting":3,'
+    '"minecraft:sweeping_edge":3'
+    '}]'
+)
+SWORD_BASE_ITEM = "netherite_sword"
+SWORD_FAILURE_SIGNALS = (
+    "Entity not found",
+    "No entity was found",
+    "RCON error",
+    "Unknown or incomplete command",
+    "Failed to parse",
+    "Unknown enchantment",
+)
+
+
+def cmd_sword(chat_id: int, arg: str, admin_name: str):
+    """Give a target player one max-tier netherite sword. Hidden from /help.
+
+    Enchant set: Sharpness V, Mending, Unbreaking III, Looting III,
+    Sweeping Edge III. Admin-only via the existing dispatcher gate.
+    """
+    toks = arg.strip().split()
+    if not toks:
+        send(chat_id, "Usage: /sword `<player>`")
+        return
+    player = toks[0]
+    if not MC_PROFILE_NAME.match(player):
+        send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
+        return
+    give_cmd = f"give {player} {SWORD_BASE_ITEM}{SWORD_ENCHANT_COMPONENT} 1"
+    out = rcon(give_cmd)
+    log.info("sword to %s by %s: %s", player, admin_name, out)
+    pe, ae = md_escape(player), md_escape(admin_name)
+    if any(sig in out for sig in SWORD_FAILURE_SIGNALS):
+        send(chat_id, f"❌ Sword give for *{pe}* failed:\n`{md_escape(out[:400])}`")
+        return
+    tail = md_escape(out) if out else "(no output)"
+    send(
+        chat_id,
+        f"⚔️ Gave *{pe}* a {SWORD_BASE_ITEM.replace('_', ' ')} with "
+        "Sharpness V · Mending · Unbreaking III · Looting III · Sweeping Edge III "
+        f"(by {ae}).\n`{tail}`",
+    )
+
 
 def cmd_villager(chat_id: int, arg: str, admin_name: str):
     """Spawn N (1–5) villagers next to a target player. Hidden from /help.
@@ -1678,6 +1731,8 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd in ("/msg", "/tell"):            cmd_msg(chat_id, arg, sender_name)
     # /villager · /vil — admin-only, intentionally hidden from /help.
     elif cmd in ("/villager", "/vil"):        cmd_villager(chat_id, arg, sender_name)
+    # /sword · /sw — admin-only god-sword giver, also hidden from /help.
+    elif cmd in ("/sword", "/sw"):            cmd_sword(chat_id, arg, sender_name)
     elif cmd in ("/wlreload", "/wlr"):       cmd_whitelist_reload(chat_id, arg, sender_name)
     elif cmd in ("/ban", "/bn"):             cmd_ban(chat_id, arg, sender_name)
     elif cmd in ("/banip", "/bi"):           cmd_banip(chat_id, arg, sender_name)
