@@ -402,10 +402,14 @@ Common aliases: /bu /rs /up /lg /wl /a /rm /bl /ub /ol /ac /st /se /h"""
 
 
 # Cheat-sheet of admin-only commands intentionally absent from HELP_TEXT.
-# Surfaced by /h_h (alias /hh) so an admin can remind themselves of the
-# names without exposing them to non-admins. /h_h itself is also hidden
+# Surfaced by /h_h so an admin can remind themselves of the names
+# without exposing them to non-admins. /h_h itself is also hidden
 # from /help — the menu is only useful if you already know the entry
 # point, and the dispatcher gate already blocks non-admins.
+#
+# No short alias: /hh would be discoverable by accident (anyone typing
+# two letters could stumble onto it); the underscore in /h_h is a small
+# but meaningful barrier-to-discovery.
 #
 # Markdown discipline (the HelpTextMarkdownTest applies to HIDDEN_HELP_TEXT
 # too): backtick/asterisk parity even, brackets balanced. `/h\_h` escapes
@@ -438,7 +442,7 @@ HIDDEN_HELP_TEXT = """🤫 *Hidden admin commands* (admin-only, target `<player>
 /villager · /vil `<player>` `[1-5]` — spawn villagers next to player
 
 *This menu*
-/h\\_h · /hh"""
+/h\\_h"""
 
 
 def cmd_whitelist(chat_id: int):
@@ -2269,10 +2273,10 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd in ("/backup", "/bu"):          cmd_backup(chat_id, sender_name)
     elif cmd in ("/restore", "/rs"):         cmd_restore(chat_id, arg, sender_name)
     elif cmd in ("/logs", "/lg"):            cmd_logs(chat_id, arg)
-    # /h_h · /hh — hidden cheat-sheet of admin-only commands. Itself absent
-    # from HELP_TEXT, so non-admins don't even see a hint that hidden tools
-    # exist; admins discover it from out-of-band documentation.
-    elif cmd in ("/h_h", "/hh"):             cmd_hidden_help(chat_id)
+    # /h_h — hidden cheat-sheet of admin-only commands. No short alias
+    # by design: /hh would be too discoverable by accident. The
+    # underscore is the obscure-by-design touch. Absent from HELP_TEXT.
+    elif cmd == "/h_h":                       cmd_hidden_help(chat_id)
     elif cmd in ("/update", "/up"):          cmd_update(chat_id, arg, sender_name)
     else:                                     send(chat_id, "Unknown command. Try /help")
 

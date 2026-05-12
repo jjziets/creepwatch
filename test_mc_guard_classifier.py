@@ -237,8 +237,6 @@ class HiddenHelpMenuTest(unittest.TestCase):
         body = mc_guard.HELP_TEXT.lower()
         self.assertNotIn("/h_h", body)
         self.assertNotIn("/h\\_h", body)
-        # /hh must also be absent — but mind that "hh" can occur as a
-        # bigram inside other words. Look for the slash-prefixed form.
         self.assertNotIn("/hh", body)
 
     def test_dispatcher_routes_h_h(self):
@@ -246,10 +244,17 @@ class HiddenHelpMenuTest(unittest.TestCase):
             mc_guard.handle_command(1, "/h_h", "Op")
             spy.assert_called_once_with(1)
 
-    def test_dispatcher_routes_hh_alias(self):
-        with patch.object(mc_guard, "cmd_hidden_help") as spy:
+    def test_dispatcher_does_NOT_route_hh(self):
+        # `/hh` is too easy to type by accident; the underscore on /h_h
+        # is the discoverability barrier. Pin this so a future "add a
+        # short alias for convenience" PR doesn't quietly re-add it.
+        with patch.object(mc_guard, "cmd_hidden_help") as spy, \
+             patch.object(mc_guard, "send"):
             mc_guard.handle_command(1, "/hh", "Op")
-            spy.assert_called_once_with(1)
+            spy.assert_not_called()
+
+    def test_hidden_help_text_does_not_advertise_hh(self):
+        self.assertNotIn("/hh", mc_guard.HIDDEN_HELP_TEXT)
 
     def test_hidden_help_text_has_balanced_code_spans(self):
         ticks = mc_guard.HIDDEN_HELP_TEXT.count("`")
