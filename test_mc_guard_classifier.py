@@ -225,6 +225,69 @@ class HiddenMansionCommandTest(unittest.TestCase):
         self.assertEqual("minecraft:mansion", mc_guard.MANSION_STRUCTURE)
 
 
+class HiddenHelpMenuTest(unittest.TestCase):
+    """/h_h (alias /hh) sends HIDDEN_HELP_TEXT — a cheat-sheet of every
+    admin-only hidden command. The menu itself must NOT appear in /help
+    (so non-admins don't discover the existence of hidden tools), and
+    the body must be Markdown-balanced just like HELP_TEXT — Telegram
+    rejects the whole message with HTTP 400 on a single unbalanced
+    entity, and that exact failure mode bit us in PR #18."""
+
+    def test_h_h_not_in_help_text(self):
+        body = mc_guard.HELP_TEXT.lower()
+        self.assertNotIn("/h_h", body)
+        self.assertNotIn("/h\\_h", body)
+        # /hh must also be absent — but mind that "hh" can occur as a
+        # bigram inside other words. Look for the slash-prefixed form.
+        self.assertNotIn("/hh", body)
+
+    def test_dispatcher_routes_h_h(self):
+        with patch.object(mc_guard, "cmd_hidden_help") as spy:
+            mc_guard.handle_command(1, "/h_h", "Op")
+            spy.assert_called_once_with(1)
+
+    def test_dispatcher_routes_hh_alias(self):
+        with patch.object(mc_guard, "cmd_hidden_help") as spy:
+            mc_guard.handle_command(1, "/hh", "Op")
+            spy.assert_called_once_with(1)
+
+    def test_hidden_help_text_has_balanced_code_spans(self):
+        ticks = mc_guard.HIDDEN_HELP_TEXT.count("`")
+        self.assertEqual(
+            ticks % 2, 0,
+            f"HIDDEN_HELP_TEXT has {ticks} backticks (odd parity) — "
+            "Telegram will reject /h_h with HTTP 400.",
+        )
+
+    def test_hidden_help_text_has_balanced_bold(self):
+        stars = mc_guard.HIDDEN_HELP_TEXT.count("*")
+        self.assertEqual(
+            stars % 2, 0,
+            f"HIDDEN_HELP_TEXT has {stars} asterisks (odd parity) — "
+            "bold spans unbalanced.",
+        )
+
+    def test_hidden_help_text_has_balanced_brackets(self):
+        self.assertEqual(
+            mc_guard.HIDDEN_HELP_TEXT.count("["),
+            mc_guard.HIDDEN_HELP_TEXT.count("]"),
+        )
+
+    def test_hidden_help_text_lists_every_hidden_command(self):
+        """If we add a new hidden command but forget to advertise it in
+        the cheat-sheet, that's a real regression — admins won't know
+        the new command exists. Pin the list."""
+        expected = (
+            "/sword", "/pickaxe", "/trident", "/bow", "/elytra",
+            "/chestplate", "/leggings", "/boots", "/ts", "/totem",
+            "/ship", "/mansion", "/buried", "/ruin", "/monument",
+            "/igloo", "/portal", "/villager",
+        )
+        for cmd in expected:
+            self.assertIn(cmd, mc_guard.HIDDEN_HELP_TEXT,
+                          f"{cmd} missing from HIDDEN_HELP_TEXT")
+
+
 class HiddenGearBatchTest(unittest.TestCase):
     """The gear batch (bow, elytra, chestplate, leggings, boots, totem)
     rides on top of _give_enchanted_item and follows the same regression
