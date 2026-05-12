@@ -297,6 +297,46 @@ class HiddenTurtleShellCommandTest(unittest.TestCase):
         self.assertIn("},minecraft:attribute_modifiers={", inside)
 
 
+class HiddenTridentCommandTest(unittest.TestCase):
+    """/trident (alias /td) gives the thrown-build trident: Loyalty III ·
+    Impaling V · Channeling · Mending · Unbreaking III. Loyalty +
+    Channeling is mutex with Riptide — keeping that flavour separate
+    would be a follow-up command. Admin-only, hidden from /help."""
+
+    def test_help_text_does_not_mention_trident_command(self):
+        body = mc_guard.HELP_TEXT.lower()
+        self.assertNotIn("/trident", body)
+        self.assertNotIn(" /td ", body)
+        self.assertFalse(body.rstrip().endswith("/td"), "trailing '/td' would reveal the alias")
+
+    def test_dispatcher_invokes_cmd_trident(self):
+        with patch.object(mc_guard, "cmd_trident") as spy:
+            mc_guard.handle_command(1, "/trident Steve", "Op")
+            spy.assert_called_once_with(1, "Steve", "Op")
+
+    def test_dispatcher_invokes_cmd_trident_via_alias(self):
+        with patch.object(mc_guard, "cmd_trident") as spy:
+            mc_guard.handle_command(1, "/td Alex", "Op")
+            spy.assert_called_once_with(1, "Alex", "Op")
+
+    def test_base_item_is_trident(self):
+        # Tridents have no tier variants — just "minecraft:trident".
+        self.assertEqual("trident", mc_guard.TRIDENT_BASE_ITEM)
+
+    def test_enchantment_component_contains_expected_set(self):
+        comp = mc_guard.TRIDENT_ENCHANT_COMPONENT
+        self.assertIn('"minecraft:loyalty":3', comp)
+        self.assertIn('"minecraft:impaling":5', comp)
+        self.assertIn('"minecraft:channeling":1', comp)
+        self.assertIn('"minecraft:mending":1', comp)
+        self.assertIn('"minecraft:unbreaking":3', comp)
+        # Riptide is mutex with Loyalty/Channeling — its absence is part
+        # of the contract for this command.
+        self.assertNotIn("riptide", comp)
+        self.assertTrue(comp.startswith("[minecraft:enchantments={"))
+        self.assertTrue(comp.endswith("}]"))
+
+
 class HiddenPickaxeCommandTest(unittest.TestCase):
     """/pickaxe (alias /pk) gives a target player a fully-kitted diamond
     pickaxe (Efficiency V · Unbreaking III · Mending · Fortune III).
