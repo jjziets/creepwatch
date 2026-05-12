@@ -207,6 +207,24 @@ class HiddenSwordCommandTest(unittest.TestCase):
         self.assertTrue(comp.endswith("}]"))
 
 
+class HiddenMansionCommandTest(unittest.TestCase):
+    """/mansion spawns a woodland mansion 50 blocks NE of the target player.
+    Admin-only, hidden from /help — same regression guards as /ship."""
+
+    def test_help_text_does_not_mention_mansion_command(self):
+        self.assertNotIn("/mansion", mc_guard.HELP_TEXT.lower())
+
+    def test_dispatcher_invokes_cmd_mansion(self):
+        with patch.object(mc_guard, "cmd_mansion") as spy:
+            mc_guard.handle_command(1, "/mansion Steve", "Op")
+            spy.assert_called_once_with(1, "Steve", "Op")
+
+    def test_structure_id_is_mansion(self):
+        # `minecraft:mansion` is the modern (1.18+) registry id. Older
+        # versions used `woodland_mansion`; pin to the current literal.
+        self.assertEqual("minecraft:mansion", mc_guard.MANSION_STRUCTURE)
+
+
 class HiddenShipCommandTest(unittest.TestCase):
     """/ship spawns a beached shipwreck structure near a target player.
     Admin-only via the dispatcher, omitted from /help. Same regression

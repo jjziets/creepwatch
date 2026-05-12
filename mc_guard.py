@@ -613,6 +613,11 @@ GIVE_FAILURE_SIGNALS = (
 # `/place structure <id>` syntax — pre-1.18 used `/locate` + structure
 # block which is not RCON-friendly.
 SHIPWRECK_STRUCTURE = "minecraft:shipwreck_beached"
+# Woodland mansion: huge (~60×60 footprint, multi-storey). Offset is
+# significantly larger than /ship so the player isn't crushed inside
+# walls when the structure pops. Chunk regeneration causes a brief
+# server hitch — generally fine on this scale of world.
+MANSION_STRUCTURE = "minecraft:mansion"
 STRUCTURE_FAILURE_SIGNALS = (
     "Entity not found",
     "No entity was found",
@@ -623,6 +628,42 @@ STRUCTURE_FAILURE_SIGNALS = (
     "couldn't place",
     "Cannot place",
 )
+
+
+def cmd_mansion(chat_id: int, arg: str, admin_name: str):
+    """Spawn a woodland mansion near a target player. Hidden from /help.
+
+    Mansions are large (~60×60 footprint, several storeys tall) so the
+    placement offset is much bigger than /ship — `+50 X / +50 Z` keeps
+    the player well outside the wall it spawns next to. Structure
+    generation rewrites a few chunks and tends to cause a noticeable
+    server hitch (a couple of seconds); broadcast nothing extra and
+    let the standard /ship-style reply convey the wait.
+    """
+    toks = arg.strip().split()
+    if not toks:
+        send(chat_id, "Usage: /mansion `<player>`")
+        return
+    player = toks[0]
+    if not MC_PROFILE_NAME.match(player):
+        send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
+        return
+    place_cmd = (
+        f"execute at {player} run place structure {MANSION_STRUCTURE} ~50 ~ ~50"
+    )
+    out = rcon(place_cmd)
+    log.info("mansion for %s by %s: %s", player, admin_name, out)
+    pe, ae = md_escape(player), md_escape(admin_name)
+    if any(sig in out for sig in STRUCTURE_FAILURE_SIGNALS):
+        send(chat_id, f"❌ /mansion for *{pe}* failed:\n`{md_escape(out[:400])}`")
+        return
+    tail = md_escape(out) if out else "(no output)"
+    send(
+        chat_id,
+        f"🏰 Spawned a woodland mansion ~50 blocks NE of *{pe}* (by {ae}). "
+        "Generation may cause a brief lag spike — that's the chunks rewriting.\n"
+        f"`{tail}`",
+    )
 
 
 def cmd_ship(chat_id: int, arg: str, admin_name: str):
@@ -1890,6 +1931,8 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd == "/ts":                        cmd_turtle_shell(chat_id, arg, sender_name)
     # /ship — admin-only treasure-shipwreck spawner, also hidden from /help.
     elif cmd == "/ship":                      cmd_ship(chat_id, arg, sender_name)
+    # /mansion — admin-only woodland-mansion spawner, also hidden from /help.
+    elif cmd == "/mansion":                   cmd_mansion(chat_id, arg, sender_name)
     elif cmd in ("/wlreload", "/wlr"):       cmd_whitelist_reload(chat_id, arg, sender_name)
     elif cmd in ("/ban", "/bn"):             cmd_ban(chat_id, arg, sender_name)
     elif cmd in ("/banip", "/bi"):           cmd_banip(chat_id, arg, sender_name)
