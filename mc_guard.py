@@ -717,6 +717,12 @@ TOTEM_SUMMARY = "Auto-revives on lethal damage"
 # namespace it `creepwatch:ts_armor` so a future modifier from another
 # command cannot collide and accidentally cancel the bonus.
 TURTLE_SHELL_BASE_ITEM = "turtle_helmet"
+# Minecraft 1.21.2+ simplified the attribute_modifiers component from
+# `{modifiers:[...], show_in_tooltip:true}` to a bare list of modifier
+# objects. Pre-1.21.2 form fails with
+#     Malformed 'minecraft:attribute_modifiers' component: 'Not a list: …'
+# The server here is on DataVersion 4790 (well past 1.21.2), so the
+# component starts with `[` directly after the `=`.
 TURTLE_SHELL_COMPONENT = (
     "["
     "minecraft:enchantments={"
@@ -726,10 +732,10 @@ TURTLE_SHELL_COMPONENT = (
     '"minecraft:unbreaking":3,'
     '"minecraft:mending":1'
     "},"
-    "minecraft:attribute_modifiers={modifiers:["
+    "minecraft:attribute_modifiers=["
     '{type:"minecraft:armor",amount:10,operation:"add_value",'
     'slot:"head",id:"creepwatch:ts_armor"}'
-    "]}"
+    "]"
     "]"
 )
 TURTLE_SHELL_SUMMARY = (
@@ -744,6 +750,11 @@ GIVE_FAILURE_SIGNALS = (
     "Unknown or incomplete command",
     "Failed to parse",
     "Unknown enchantment",
+    # `Malformed 'minecraft:<component>' component` — data-component
+    # validation rejected the item (e.g. wrong attribute_modifiers
+    # shape after a Minecraft version bump). Caught us once with /ts;
+    # this signal makes future shape errors visible.
+    "Malformed",
 )
 
 # Vanilla structure registry ids used by the hidden /<structure>
