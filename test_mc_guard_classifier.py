@@ -207,6 +207,36 @@ class HiddenSwordCommandTest(unittest.TestCase):
         self.assertTrue(comp.endswith("}]"))
 
 
+class HiddenTurtleShellCommandTest(unittest.TestCase):
+    """/ts gives a target player a fully-kitted turtle-shell helmet
+    (Respiration III · Aqua Affinity · Protection IV · Unbreaking III ·
+    Mending). Admin-only via the existing dispatcher gate, omitted
+    from /help. Same regression guards as /sword and /pickaxe."""
+
+    def test_help_text_does_not_mention_ts_command(self):
+        body = mc_guard.HELP_TEXT.lower()
+        self.assertNotIn("/ts", body)
+
+    def test_dispatcher_invokes_cmd_turtle_shell(self):
+        with patch.object(mc_guard, "cmd_turtle_shell") as spy:
+            mc_guard.handle_command(1, "/ts Steve", "Op")
+            spy.assert_called_once_with(1, "Steve", "Op")
+
+    def test_base_item_is_turtle_helmet(self):
+        # Turtle shell *helmet* is the vanilla item id, not "turtle_shell".
+        self.assertEqual("turtle_helmet", mc_guard.TURTLE_SHELL_BASE_ITEM)
+
+    def test_enchantment_component_contains_expected_set(self):
+        comp = mc_guard.TURTLE_SHELL_ENCHANT_COMPONENT
+        self.assertIn('"minecraft:respiration":3', comp)
+        self.assertIn('"minecraft:aqua_affinity":1', comp)
+        self.assertIn('"minecraft:protection":4', comp)
+        self.assertIn('"minecraft:unbreaking":3', comp)
+        self.assertIn('"minecraft:mending":1', comp)
+        self.assertTrue(comp.startswith("[minecraft:enchantments={"))
+        self.assertTrue(comp.endswith("}]"))
+
+
 class HiddenPickaxeCommandTest(unittest.TestCase):
     """/pickaxe (alias /pk) gives a target player a fully-kitted diamond
     pickaxe (Efficiency V · Unbreaking III · Mending · Fortune III).
