@@ -207,6 +207,59 @@ class HiddenSwordCommandTest(unittest.TestCase):
         self.assertTrue(comp.endswith("}]"))
 
 
+class HiddenTurtleShellCommandTest(unittest.TestCase):
+    """/ts gives a target player a fully-kitted turtle-shell helmet
+    (Respiration III · Aqua Affinity · Protection IV · Unbreaking III ·
+    Mending). Admin-only via the existing dispatcher gate, omitted
+    from /help. Same regression guards as /sword and /pickaxe."""
+
+    def test_help_text_does_not_mention_ts_command(self):
+        body = mc_guard.HELP_TEXT.lower()
+        self.assertNotIn("/ts", body)
+
+    def test_dispatcher_invokes_cmd_turtle_shell(self):
+        with patch.object(mc_guard, "cmd_turtle_shell") as spy:
+            mc_guard.handle_command(1, "/ts Steve", "Op")
+            spy.assert_called_once_with(1, "Steve", "Op")
+
+    def test_base_item_is_turtle_helmet(self):
+        # Turtle shell *helmet* is the vanilla item id, not "turtle_shell".
+        self.assertEqual("turtle_helmet", mc_guard.TURTLE_SHELL_BASE_ITEM)
+
+    def test_component_contains_expected_enchantment_set(self):
+        comp = mc_guard.TURTLE_SHELL_COMPONENT
+        self.assertIn('"minecraft:respiration":3', comp)
+        self.assertIn('"minecraft:aqua_affinity":1', comp)
+        self.assertIn('"minecraft:protection":4', comp)
+        self.assertIn('"minecraft:unbreaking":3', comp)
+        self.assertIn('"minecraft:mending":1', comp)
+
+    def test_component_carries_armor_attribute_modifier(self):
+        # The helmet has to deliver the ~50% damage-reduction promise.
+        # If a future Minecraft version renames the attribute or changes
+        # the operation enum, the give command will silently fall back to
+        # a vanilla turtle helmet — this assertion makes that loud.
+        comp = mc_guard.TURTLE_SHELL_COMPONENT
+        self.assertIn("minecraft:attribute_modifiers", comp)
+        self.assertIn('type:"minecraft:armor"', comp)
+        self.assertIn("amount:10", comp)
+        self.assertIn('operation:"add_value"', comp)
+        self.assertIn('slot:"head"', comp)
+        # Resource-location id keeps this modifier identifiable and
+        # prevents collisions with any future modifier we add.
+        self.assertIn('id:"creepwatch:ts_armor"', comp)
+
+    def test_component_is_well_formed_component_list(self):
+        comp = mc_guard.TURTLE_SHELL_COMPONENT
+        self.assertTrue(comp.startswith("["))
+        self.assertTrue(comp.endswith("]"))
+        # Two components inside the brackets: separated by exactly one comma.
+        # We're not parsing the full SNBT, just guarding against the obvious
+        # "forgot the comma between components" shape error.
+        inside = comp[1:-1]
+        self.assertIn("},minecraft:attribute_modifiers={", inside)
+
+
 class HiddenPickaxeCommandTest(unittest.TestCase):
     """/pickaxe (alias /pk) gives a target player a fully-kitted diamond
     pickaxe (Efficiency V · Unbreaking III · Mending · Fortune III).
