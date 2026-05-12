@@ -581,6 +581,85 @@ TRIDENT_ENCHANT_COMPONENT = (
 )
 TRIDENT_SUMMARY = "Loyalty III · Impaling V · Channeling · Mending · Unbreaking III"
 
+# Bow: Infinity build (admin-gift vibe — bow lasts ~1000 shots on
+# Unbreaking III alone; player never has to farm arrows). Infinity is
+# mutex with Mending; the call here is to favour zero-arrow gameplay
+# over auto-repair.
+BOW_BASE_ITEM = "bow"
+BOW_ENCHANT_COMPONENT = (
+    '[minecraft:enchantments={'
+    '"minecraft:power":5,'
+    '"minecraft:punch":2,'
+    '"minecraft:flame":1,'
+    '"minecraft:infinity":1,'
+    '"minecraft:unbreaking":3'
+    '}]'
+)
+BOW_SUMMARY = "Power V · Punch II · Flame · Infinity · Unbreaking III"
+
+# Elytra: only two enchants ever apply. Mending lets it auto-repair
+# from XP, Unbreaking stretches the durability ~3×. No fancy choices.
+ELYTRA_BASE_ITEM = "elytra"
+ELYTRA_ENCHANT_COMPONENT = (
+    '[minecraft:enchantments={'
+    '"minecraft:unbreaking":3,'
+    '"minecraft:mending":1'
+    '}]'
+)
+ELYTRA_SUMMARY = "Unbreaking III · Mending"
+
+# Armor set — netherite base, Protection IV / Unbreaking III / Mending
+# universally. Boots and leggings carry slot-specific extras.
+CHESTPLATE_BASE_ITEM = "netherite_chestplate"
+CHESTPLATE_ENCHANT_COMPONENT = (
+    '[minecraft:enchantments={'
+    '"minecraft:protection":4,'
+    '"minecraft:unbreaking":3,'
+    '"minecraft:mending":1'
+    '}]'
+)
+CHESTPLATE_SUMMARY = "Protection IV · Unbreaking III · Mending"
+
+# Leggings: Swift Sneak III. Treasure-only enchant from ancient cities,
+# but RCON give accepts it. Boosts sneak speed substantially.
+LEGGINGS_BASE_ITEM = "netherite_leggings"
+LEGGINGS_ENCHANT_COMPONENT = (
+    '[minecraft:enchantments={'
+    '"minecraft:protection":4,'
+    '"minecraft:swift_sneak":3,'
+    '"minecraft:unbreaking":3,'
+    '"minecraft:mending":1'
+    '}]'
+)
+LEGGINGS_SUMMARY = "Protection IV · Swift Sneak III · Unbreaking III · Mending"
+
+# Boots: the kitchen-sink of foot enchants. Feather Falling cancels
+# fall damage, Depth Strider lets you walk-through-water, Soul Speed
+# (treasure-only, ancient cities / piglin bartering) makes soul sand
+# fast instead of slow. All non-mutex with each other.
+BOOTS_BASE_ITEM = "netherite_boots"
+BOOTS_ENCHANT_COMPONENT = (
+    '[minecraft:enchantments={'
+    '"minecraft:protection":4,'
+    '"minecraft:feather_falling":4,'
+    '"minecraft:depth_strider":3,'
+    '"minecraft:soul_speed":3,'
+    '"minecraft:unbreaking":3,'
+    '"minecraft:mending":1'
+    '}]'
+)
+BOOTS_SUMMARY = (
+    "Protection IV · Feather Falling IV · Depth Strider III · "
+    "Soul Speed III · Unbreaking III · Mending"
+)
+
+# Totem of Undying: not enchantable. We still want a one-line admin
+# command for it, so we pass component="" to the existing helper —
+# the resulting RCON command is simply `give <player> totem_of_undying 1`.
+TOTEM_BASE_ITEM = "totem_of_undying"
+TOTEM_ENCHANT_COMPONENT = ""  # totems take no enchantments
+TOTEM_SUMMARY = "Auto-revives on lethal damage"
+
 # Aquatic helmet: water-breathing + underwater mining + max armour
 # protection. Two components on the item:
 #  1) minecraft:enchantments — the five enchant ids/levels.
@@ -874,6 +953,80 @@ def cmd_trident(chat_id: int, arg: str, admin_name: str):
         component=TRIDENT_ENCHANT_COMPONENT,
         summary=TRIDENT_SUMMARY,
         cmd_label="trident",
+    )
+
+
+def cmd_bow(chat_id: int, arg: str, admin_name: str):
+    """Bow — Infinity build. Hidden from /help."""
+    _give_enchanted_item(
+        chat_id, arg, admin_name,
+        icon="🏹",
+        base_item=BOW_BASE_ITEM,
+        component=BOW_ENCHANT_COMPONENT,
+        summary=BOW_SUMMARY,
+        cmd_label="bow",
+    )
+
+
+def cmd_elytra(chat_id: int, arg: str, admin_name: str):
+    """Elytra. Hidden from /help."""
+    _give_enchanted_item(
+        chat_id, arg, admin_name,
+        icon="🪽",
+        base_item=ELYTRA_BASE_ITEM,
+        component=ELYTRA_ENCHANT_COMPONENT,
+        summary=ELYTRA_SUMMARY,
+        cmd_label="elytra",
+    )
+
+
+def cmd_chestplate(chat_id: int, arg: str, admin_name: str):
+    """Netherite chestplate. Hidden from /help."""
+    _give_enchanted_item(
+        chat_id, arg, admin_name,
+        icon="🦺",
+        base_item=CHESTPLATE_BASE_ITEM,
+        component=CHESTPLATE_ENCHANT_COMPONENT,
+        summary=CHESTPLATE_SUMMARY,
+        cmd_label="chestplate",
+    )
+
+
+def cmd_leggings(chat_id: int, arg: str, admin_name: str):
+    """Netherite leggings with Swift Sneak III. Hidden from /help."""
+    _give_enchanted_item(
+        chat_id, arg, admin_name,
+        icon="👖",
+        base_item=LEGGINGS_BASE_ITEM,
+        component=LEGGINGS_ENCHANT_COMPONENT,
+        summary=LEGGINGS_SUMMARY,
+        cmd_label="leggings",
+    )
+
+
+def cmd_boots(chat_id: int, arg: str, admin_name: str):
+    """Netherite boots, kitchen-sink enchants. Hidden from /help."""
+    _give_enchanted_item(
+        chat_id, arg, admin_name,
+        icon="🥾",
+        base_item=BOOTS_BASE_ITEM,
+        component=BOOTS_ENCHANT_COMPONENT,
+        summary=BOOTS_SUMMARY,
+        cmd_label="boots",
+    )
+
+
+def cmd_totem(chat_id: int, arg: str, admin_name: str):
+    """Totem of Undying — no enchants, just the item. Hidden from /help.
+    Passes component="" so the give command is a plain
+    `give <player> totem_of_undying 1`."""
+    _give_enchanted_item(
+        chat_id, arg, admin_name,
+        icon="🗿",
+        base_item=TOTEM_BASE_ITEM,
+        component=TOTEM_ENCHANT_COMPONENT,
+        summary=TOTEM_SUMMARY,
+        cmd_label="totem",
     )
 
 
@@ -2038,6 +2191,15 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd in ("/pickaxe", "/pk"):          cmd_pickaxe(chat_id, arg, sender_name)
     # /trident · /td — admin-only thrown-trident giver, also hidden from /help.
     elif cmd in ("/trident", "/td"):          cmd_trident(chat_id, arg, sender_name)
+    # Gear batch — bow, elytra, full armor set, totem. All admin-only,
+    # all absent from HELP_TEXT. /lg is already used by /logs so /leggings
+    # has no short alias.
+    elif cmd in ("/bow", "/bw"):              cmd_bow(chat_id, arg, sender_name)
+    elif cmd in ("/elytra", "/el"):           cmd_elytra(chat_id, arg, sender_name)
+    elif cmd in ("/chestplate", "/cp"):       cmd_chestplate(chat_id, arg, sender_name)
+    elif cmd == "/leggings":                  cmd_leggings(chat_id, arg, sender_name)
+    elif cmd in ("/boots", "/bt"):            cmd_boots(chat_id, arg, sender_name)
+    elif cmd == "/totem":                     cmd_totem(chat_id, arg, sender_name)
     # /ts — admin-only turtle-shell helmet giver, also hidden from /help.
     elif cmd == "/ts":                        cmd_turtle_shell(chat_id, arg, sender_name)
     # Hidden structure spawners. All admin-only via the dispatcher gate,

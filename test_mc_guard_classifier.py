@@ -225,6 +225,86 @@ class HiddenMansionCommandTest(unittest.TestCase):
         self.assertEqual("minecraft:mansion", mc_guard.MANSION_STRUCTURE)
 
 
+class HiddenGearBatchTest(unittest.TestCase):
+    """The gear batch (bow, elytra, chestplate, leggings, boots, totem)
+    rides on top of _give_enchanted_item and follows the same regression
+    contract as /sword and /pickaxe: each command is dispatcher-routed
+    on its short and (optionally) alias forms, absent from /help, and
+    the base item literal is pinned so a future Minecraft rename doesn't
+    silently turn it into a bare item. Component contents are spot-checked
+    only where the enchant choice matters (Infinity vs Mending on bow,
+    Swift Sneak presence on leggings, totem has empty component)."""
+
+    CASES = (
+        # (full_cmd, alias_or_None, cmd_fn_attr, base_item_attr, expected_base)
+        ("/bow",        "/bw", "cmd_bow",        "BOW_BASE_ITEM",        "bow"),
+        ("/elytra",     "/el", "cmd_elytra",     "ELYTRA_BASE_ITEM",     "elytra"),
+        ("/chestplate", "/cp", "cmd_chestplate", "CHESTPLATE_BASE_ITEM", "netherite_chestplate"),
+        ("/leggings",   None,  "cmd_leggings",   "LEGGINGS_BASE_ITEM",   "netherite_leggings"),
+        ("/boots",      "/bt", "cmd_boots",      "BOOTS_BASE_ITEM",      "netherite_boots"),
+        ("/totem",      None,  "cmd_totem",      "TOTEM_BASE_ITEM",      "totem_of_undying"),
+    )
+
+    def test_no_gear_command_leaks_into_help(self):
+        body = mc_guard.HELP_TEXT.lower()
+        for full_cmd, alias, _fn, _const, _base in self.CASES:
+            self.assertNotIn(full_cmd, body, f"{full_cmd} must not appear in HELP_TEXT")
+            if alias is not None:
+                self.assertNotIn(f" {alias} ", body)
+                self.assertFalse(body.rstrip().endswith(alias), f"trailing {alias} would reveal the alias")
+
+    def test_dispatcher_routes_each_full_command(self):
+        for full_cmd, _alias, fn_attr, _const, _base in self.CASES:
+            with self.subTest(cmd=full_cmd):
+                with patch.object(mc_guard, fn_attr) as spy:
+                    mc_guard.handle_command(1, f"{full_cmd} Steve", "Op")
+                    spy.assert_called_once_with(1, "Steve", "Op")
+
+    def test_dispatcher_routes_each_alias(self):
+        for full_cmd, alias, fn_attr, _const, _base in self.CASES:
+            if alias is None:
+                continue
+            with self.subTest(cmd=alias):
+                with patch.object(mc_guard, fn_attr) as spy:
+                    mc_guard.handle_command(1, f"{alias} Steve", "Op")
+                    spy.assert_called_once_with(1, "Steve", "Op")
+
+    def test_base_items_are_pinned(self):
+        for full_cmd, _alias, _fn, const_attr, expected in self.CASES:
+            with self.subTest(cmd=full_cmd):
+                self.assertEqual(
+                    expected,
+                    getattr(mc_guard, const_attr),
+                    f"{const_attr} drifted from {expected!r}",
+                )
+
+    def test_bow_uses_infinity_not_mending(self):
+        # Mending is mutex with Infinity. The product call was Infinity.
+        # If a future edit drops Infinity (or adds Mending), this fails.
+        comp = mc_guard.BOW_ENCHANT_COMPONENT
+        self.assertIn('"minecraft:infinity":1', comp)
+        self.assertNotIn("mending", comp)
+
+    def test_leggings_carry_swift_sneak(self):
+        # Swift Sneak is treasure-only; without it the leggings are
+        # just a tier-IV protection set. Worth pinning.
+        self.assertIn('"minecraft:swift_sneak":3', mc_guard.LEGGINGS_ENCHANT_COMPONENT)
+
+    def test_boots_carry_full_movement_set(self):
+        comp = mc_guard.BOOTS_ENCHANT_COMPONENT
+        for enchant in (
+            "feather_falling", "depth_strider", "soul_speed",
+            "protection", "unbreaking", "mending",
+        ):
+            self.assertIn(f"minecraft:{enchant}", comp)
+
+    def test_totem_component_is_empty(self):
+        # Totems take no enchants. An empty component means the give
+        # command is `give <player> totem_of_undying 1` — exactly what
+        # we want.
+        self.assertEqual("", mc_guard.TOTEM_ENCHANT_COMPONENT)
+
+
 class HiddenStructureBatchTest(unittest.TestCase):
     """The five additional /place-structure commands (/buried /ruin
     /monument /igloo /portal) plus the refactored /ship and /mansion
