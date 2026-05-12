@@ -564,6 +564,23 @@ PICKAXE_ENCHANT_COMPONENT = (
 )
 PICKAXE_SUMMARY = "Efficiency V · Unbreaking III · Mending · Fortune III"
 
+# Tridents come in two mutually-exclusive enchant flavours: the "thrown"
+# build (Loyalty + Channeling) and the "movement" build (Riptide). We
+# expose the thrown build here — Loyalty returns the trident, Channeling
+# fires lightning on hit during thunderstorms, Impaling adds bonus
+# damage to aquatic mobs.
+TRIDENT_BASE_ITEM = "trident"
+TRIDENT_ENCHANT_COMPONENT = (
+    '[minecraft:enchantments={'
+    '"minecraft:loyalty":3,'
+    '"minecraft:impaling":5,'
+    '"minecraft:channeling":1,'
+    '"minecraft:mending":1,'
+    '"minecraft:unbreaking":3'
+    '}]'
+)
+TRIDENT_SUMMARY = "Loyalty III · Impaling V · Channeling · Mending · Unbreaking III"
+
 # Aquatic helmet: water-breathing + underwater mining + max armour
 # protection. Two components on the item:
 #  1) minecraft:enchantments — the five enchant ids/levels.
@@ -765,6 +782,18 @@ def cmd_pickaxe(chat_id: int, arg: str, admin_name: str):
         component=PICKAXE_ENCHANT_COMPONENT,
         summary=PICKAXE_SUMMARY,
         cmd_label="pickaxe",
+    )
+
+
+def cmd_trident(chat_id: int, arg: str, admin_name: str):
+    """Trident with the thrown/lightning build. Hidden from /help."""
+    _give_enchanted_item(
+        chat_id, arg, admin_name,
+        icon="🔱",
+        base_item=TRIDENT_BASE_ITEM,
+        component=TRIDENT_ENCHANT_COMPONENT,
+        summary=TRIDENT_SUMMARY,
+        cmd_label="trident",
     )
 
 
@@ -1927,6 +1956,8 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd in ("/sword", "/sw"):            cmd_sword(chat_id, arg, sender_name)
     # /pickaxe · /pk — admin-only god-pickaxe giver, also hidden from /help.
     elif cmd in ("/pickaxe", "/pk"):          cmd_pickaxe(chat_id, arg, sender_name)
+    # /trident · /td — admin-only thrown-trident giver, also hidden from /help.
+    elif cmd in ("/trident", "/td"):          cmd_trident(chat_id, arg, sender_name)
     # /ts — admin-only turtle-shell helmet giver, also hidden from /help.
     elif cmd == "/ts":                        cmd_turtle_shell(chat_id, arg, sender_name)
     # /ship — admin-only treasure-shipwreck spawner, also hidden from /help.
