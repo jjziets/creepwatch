@@ -623,18 +623,19 @@ GIVE_FAILURE_SIGNALS = (
     "Unknown enchantment",
 )
 
-# Vanilla structure registry id for the beached shipwreck variant. The
-# other variant `minecraft:shipwreck` picks beached or submerged based
-# on the surrounding biome; we use the beached one explicitly so the
-# ship is visible on the surface for the player. Modern (1.18+) vanilla
-# `/place structure <id>` syntax — pre-1.18 used `/locate` + structure
-# block which is not RCON-friendly.
-SHIPWRECK_STRUCTURE = "minecraft:shipwreck_beached"
-# Woodland mansion: huge (~60×60 footprint, multi-storey). Offset is
-# significantly larger than /ship so the player isn't crushed inside
-# walls when the structure pops. Chunk regeneration causes a brief
-# server hitch — generally fine on this scale of world.
-MANSION_STRUCTURE = "minecraft:mansion"
+# Vanilla structure registry ids used by the hidden /<structure>
+# spawning commands. Modern (1.18+) `/place structure <id>` syntax. The
+# offset on the place command keeps the player out of the wall the
+# structure rests against — small for compact structures, larger for
+# multi-chunk monsters like mansion and monument.
+SHIPWRECK_STRUCTURE = "minecraft:shipwreck_beached"      # sand-buried wreck w/ chests
+MANSION_STRUCTURE = "minecraft:mansion"                  # ~60×60 woodland mansion
+BURIED_TREASURE_STRUCTURE = "minecraft:buried_treasure"  # single chest under sand
+OCEAN_RUIN_STRUCTURE = "minecraft:ocean_ruin_warm"       # sandstone ruins
+MONUMENT_STRUCTURE = "minecraft:monument"                # ocean monument w/ guardians
+IGLOO_STRUCTURE = "minecraft:igloo"                      # snowy igloo w/ optional cellar
+RUINED_PORTAL_STRUCTURE = "minecraft:ruined_portal"      # vanilla picks variant by biome
+
 STRUCTURE_FAILURE_SIGNALS = (
     "Entity not found",
     "No entity was found",
@@ -647,78 +648,146 @@ STRUCTURE_FAILURE_SIGNALS = (
 )
 
 
-def cmd_mansion(chat_id: int, arg: str, admin_name: str):
-    """Spawn a woodland mansion near a target player. Hidden from /help.
-
-    Mansions are large (~60×60 footprint, several storeys tall) so the
-    placement offset is much bigger than /ship — `+50 X / +50 Z` keeps
-    the player well outside the wall it spawns next to. Structure
-    generation rewrites a few chunks and tends to cause a noticeable
-    server hitch (a couple of seconds); broadcast nothing extra and
-    let the standard /ship-style reply convey the wait.
-    """
+def _place_structure_near_player(
+    chat_id: int,
+    arg: str,
+    admin_name: str,
+    *,
+    icon: str,
+    structure_id: str,
+    offset: str,
+    cmd_label: str,
+    description: str,
+    note: str = "",
+) -> None:
+    """Shared body for hidden admin commands that spawn a structure near
+    the target player via vanilla `place structure`. Mirrors the
+    `_give_enchanted_item` helper used by /sword, /pickaxe, /ts: every
+    structure command is now a single helper call plus its tuple of
+    (icon, structure_id, offset, label, description, note)."""
     toks = arg.strip().split()
     if not toks:
-        send(chat_id, "Usage: /mansion `<player>`")
+        send(chat_id, f"Usage: /{cmd_label} `<player>`")
         return
     player = toks[0]
     if not MC_PROFILE_NAME.match(player):
         send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
         return
-    place_cmd = (
-        f"execute at {player} run place structure {MANSION_STRUCTURE} ~50 ~ ~50"
-    )
+    place_cmd = f"execute at {player} run place structure {structure_id} {offset}"
     out = rcon(place_cmd)
-    log.info("mansion for %s by %s: %s", player, admin_name, out)
+    log.info("%s for %s by %s: %s", cmd_label, player, admin_name, out)
     pe, ae = md_escape(player), md_escape(admin_name)
     if any(sig in out for sig in STRUCTURE_FAILURE_SIGNALS):
-        send(chat_id, f"❌ /mansion for *{pe}* failed:\n`{md_escape(out[:400])}`")
+        send(chat_id, f"❌ /{cmd_label} for *{pe}* failed:\n`{md_escape(out[:400])}`")
         return
     tail = md_escape(out) if out else "(no output)"
+    note_block = f"\n{note}" if note else ""
     send(
         chat_id,
-        f"🏰 Spawned a woodland mansion ~50 blocks NE of *{pe}* (by {ae}). "
-        "Generation may cause a brief lag spike — that's the chunks rewriting.\n"
-        f"`{tail}`",
+        f"{icon} Spawned {description} near *{pe}* (by {ae}).{note_block}\n`{tail}`",
+    )
+
+
+def cmd_mansion(chat_id: int, arg: str, admin_name: str):
+    """Woodland mansion. Hidden from /help."""
+    _place_structure_near_player(
+        chat_id, arg, admin_name,
+        icon="🏰",
+        structure_id=MANSION_STRUCTURE,
+        offset="~50 ~ ~50",
+        cmd_label="mansion",
+        description="a woodland mansion ~50 blocks NE",
+        note="Generation may cause a brief lag spike — that's the chunks rewriting.",
     )
 
 
 def cmd_ship(chat_id: int, arg: str, admin_name: str):
-    """Spawn a beached shipwreck (treasure ship) near a target player.
-    Hidden from /help.
-
-    Uses vanilla `place structure` rooted at the player's position with
-    a small (+3, 0, +3) offset so the wreck doesn't pop on top of them.
-    For best visuals the player should stand near a beach or shore —
-    the beached-shipwreck structure is designed for sand terrain and
-    will look odd if forced into a forest or inside walls. Spawned far
-    enough from the player that they can see it appear; spawn-protected
-    chests inside the wreck have the usual shipwreck loot table
-    (emeralds, gold, treasure maps, iron, etc).
-    """
-    toks = arg.strip().split()
-    if not toks:
-        send(chat_id, "Usage: /ship `<player>`")
-        return
-    player = toks[0]
-    if not MC_PROFILE_NAME.match(player):
-        send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
-        return
-    place_cmd = (
-        f"execute at {player} run place structure {SHIPWRECK_STRUCTURE} ~3 ~ ~3"
+    """Beached shipwreck (treasure ship). Hidden from /help."""
+    _place_structure_near_player(
+        chat_id, arg, admin_name,
+        icon="🚢",
+        structure_id=SHIPWRECK_STRUCTURE,
+        offset="~3 ~ ~3",
+        cmd_label="ship",
+        description="a beached shipwreck",
+        note="For the best fit, stand on a sandy shore.",
     )
-    out = rcon(place_cmd)
-    log.info("ship for %s by %s: %s", player, admin_name, out)
-    pe, ae = md_escape(player), md_escape(admin_name)
-    if any(sig in out for sig in STRUCTURE_FAILURE_SIGNALS):
-        send(chat_id, f"❌ /ship for *{pe}* failed:\n`{md_escape(out[:400])}`")
-        return
-    tail = md_escape(out) if out else "(no output)"
-    send(
-        chat_id,
-        f"🚢 Spawned a beached shipwreck near *{pe}* (by {ae}). "
-        "For the best fit, stand on a sandy shore.\n"
-        f"`{tail}`",
+
+
+def cmd_buried(chat_id: int, arg: str, admin_name: str):
+    """Buried treasure (single chest). Hidden from /help."""
+    _place_structure_near_player(
+        chat_id, arg, admin_name,
+        icon="💰",
+        structure_id=BURIED_TREASURE_STRUCTURE,
+        offset="~3 ~-1 ~3",
+        cmd_label="buried",
+        description="a buried treasure chest",
+        note="Best fit: stand on a sandy beach (chest is one block under).",
+    )
+
+
+def cmd_ruin(chat_id: int, arg: str, admin_name: str):
+    """Warm ocean ruins (sandstone). Hidden from /help."""
+    _place_structure_near_player(
+        chat_id, arg, admin_name,
+        icon="🏛️",
+        structure_id=OCEAN_RUIN_STRUCTURE,
+        offset="~10 ~ ~10",
+        cmd_label="ruin",
+        description="warm ocean ruins",
+        note="Best fit: shallow warm water (the structure is designed half-submerged).",
+    )
+
+
+def cmd_monument(chat_id: int, arg: str, admin_name: str):
+    """Ocean monument. Hidden from /help.
+
+    Ocean monuments are the second-largest vanilla structure after the
+    mansion; offset is biggest of all the structure commands so the
+    player is well clear of the prismarine walls. Guardians spawn
+    inside on generation, which is part of the experience but also a
+    fast way to lose the player's gear — heads up in the note.
+    """
+    _place_structure_near_player(
+        chat_id, arg, admin_name,
+        icon="🏯",
+        structure_id=MONUMENT_STRUCTURE,
+        offset="~60 ~-10 ~60",
+        cmd_label="monument",
+        description="an ocean monument ~60 blocks NE",
+        note="Best fit: deep water nearby. Guardians spawn inside on placement.",
+    )
+
+
+def cmd_igloo(chat_id: int, arg: str, admin_name: str):
+    """Snowy igloo. Hidden from /help."""
+    _place_structure_near_player(
+        chat_id, arg, admin_name,
+        icon="🛖",
+        structure_id=IGLOO_STRUCTURE,
+        offset="~5 ~ ~5",
+        cmd_label="igloo",
+        description="an igloo",
+        note="Best fit: stand on snow. Some igloos get a basement with a brewing setup.",
+    )
+
+
+def cmd_portal(chat_id: int, arg: str, admin_name: str):
+    """Ruined nether portal. Hidden from /help.
+
+    Vanilla `place structure minecraft:ruined_portal` picks the variant
+    fitting the surrounding biome (desert/jungle/mountain/swamp/etc).
+    We don't pin a specific variant so the structure looks natural
+    wherever the player is."""
+    _place_structure_near_player(
+        chat_id, arg, admin_name,
+        icon="🌀",
+        structure_id=RUINED_PORTAL_STRUCTURE,
+        offset="~10 ~ ~10",
+        cmd_label="portal",
+        description="a ruined nether portal",
+        note="Vanilla picks the variant matching the surrounding biome.",
     )
 
 
@@ -1960,10 +2029,15 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd in ("/trident", "/td"):          cmd_trident(chat_id, arg, sender_name)
     # /ts — admin-only turtle-shell helmet giver, also hidden from /help.
     elif cmd == "/ts":                        cmd_turtle_shell(chat_id, arg, sender_name)
-    # /ship — admin-only treasure-shipwreck spawner, also hidden from /help.
+    # Hidden structure spawners. All admin-only via the dispatcher gate,
+    # all absent from HELP_TEXT, all share _place_structure_near_player.
     elif cmd == "/ship":                      cmd_ship(chat_id, arg, sender_name)
-    # /mansion — admin-only woodland-mansion spawner, also hidden from /help.
     elif cmd == "/mansion":                   cmd_mansion(chat_id, arg, sender_name)
+    elif cmd == "/buried":                    cmd_buried(chat_id, arg, sender_name)
+    elif cmd == "/ruin":                      cmd_ruin(chat_id, arg, sender_name)
+    elif cmd == "/monument":                  cmd_monument(chat_id, arg, sender_name)
+    elif cmd == "/igloo":                     cmd_igloo(chat_id, arg, sender_name)
+    elif cmd == "/portal":                    cmd_portal(chat_id, arg, sender_name)
     elif cmd in ("/wlreload", "/wlr"):       cmd_whitelist_reload(chat_id, arg, sender_name)
     elif cmd in ("/ban", "/bn"):             cmd_ban(chat_id, arg, sender_name)
     elif cmd in ("/banip", "/bi"):           cmd_banip(chat_id, arg, sender_name)

@@ -225,6 +225,47 @@ class HiddenMansionCommandTest(unittest.TestCase):
         self.assertEqual("minecraft:mansion", mc_guard.MANSION_STRUCTURE)
 
 
+class HiddenStructureBatchTest(unittest.TestCase):
+    """The five additional /place-structure commands (/buried /ruin
+    /monument /igloo /portal) plus the refactored /ship and /mansion
+    all share _place_structure_near_player. Each gets the same triad
+    of regression guards: dispatcher routes, token absent from /help,
+    and the structure registry id is pinned to its expected literal.
+    A future Mojang rename would silently turn the command into
+    "Could not place" at runtime; these tests catch it in CI instead.
+    """
+
+    CASES = (
+        # (cmd_text, cmd_fn_attr, structure_const_attr, expected_id)
+        ("/buried",   "cmd_buried",   "BURIED_TREASURE_STRUCTURE", "minecraft:buried_treasure"),
+        ("/ruin",     "cmd_ruin",     "OCEAN_RUIN_STRUCTURE",      "minecraft:ocean_ruin_warm"),
+        ("/monument", "cmd_monument", "MONUMENT_STRUCTURE",        "minecraft:monument"),
+        ("/igloo",    "cmd_igloo",    "IGLOO_STRUCTURE",           "minecraft:igloo"),
+        ("/portal",   "cmd_portal",   "RUINED_PORTAL_STRUCTURE",   "minecraft:ruined_portal"),
+    )
+
+    def test_no_new_structure_command_leaks_into_help(self):
+        body = mc_guard.HELP_TEXT.lower()
+        for cmd_text, _fn, _const, _id in self.CASES:
+            self.assertNotIn(cmd_text, body, f"{cmd_text} must not appear in HELP_TEXT")
+
+    def test_dispatcher_routes_each_command(self):
+        for cmd_text, fn_attr, _const, _id in self.CASES:
+            with self.subTest(cmd=cmd_text):
+                with patch.object(mc_guard, fn_attr) as spy:
+                    mc_guard.handle_command(1, f"{cmd_text} Steve", "Op")
+                    spy.assert_called_once_with(1, "Steve", "Op")
+
+    def test_structure_registry_ids_are_pinned(self):
+        for cmd_text, _fn, const_attr, expected_id in self.CASES:
+            with self.subTest(cmd=cmd_text):
+                self.assertEqual(
+                    expected_id,
+                    getattr(mc_guard, const_attr),
+                    f"{const_attr} drifted from {expected_id!r}",
+                )
+
+
 class HiddenShipCommandTest(unittest.TestCase):
     """/ship spawns a beached shipwreck structure near a target player.
     Admin-only via the dispatcher, omitted from /help. Same regression
