@@ -207,6 +207,25 @@ class HiddenSwordCommandTest(unittest.TestCase):
         self.assertTrue(comp.endswith("}]"))
 
 
+class HiddenShipCommandTest(unittest.TestCase):
+    """/ship spawns a beached shipwreck structure near a target player.
+    Admin-only via the dispatcher, omitted from /help. Same regression
+    guards as the other hidden commands."""
+
+    def test_help_text_does_not_mention_ship_command(self):
+        self.assertNotIn("/ship", mc_guard.HELP_TEXT.lower())
+
+    def test_dispatcher_invokes_cmd_ship(self):
+        with patch.object(mc_guard, "cmd_ship") as spy:
+            mc_guard.handle_command(1, "/ship Steve", "Op")
+            spy.assert_called_once_with(1, "Steve", "Op")
+
+    def test_structure_id_is_beached_shipwreck(self):
+        # If Mojang ever renames the registry id, vanilla `place structure`
+        # silently returns "Could not place"; pin the expected literal.
+        self.assertEqual("minecraft:shipwreck_beached", mc_guard.SHIPWRECK_STRUCTURE)
+
+
 class HiddenTurtleShellCommandTest(unittest.TestCase):
     """/ts gives a target player a fully-kitted turtle-shell helmet
     (Respiration III · Aqua Affinity · Protection IV · Unbreaking III ·

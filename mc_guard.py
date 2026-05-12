@@ -606,6 +606,63 @@ GIVE_FAILURE_SIGNALS = (
     "Unknown enchantment",
 )
 
+# Vanilla structure registry id for the beached shipwreck variant. The
+# other variant `minecraft:shipwreck` picks beached or submerged based
+# on the surrounding biome; we use the beached one explicitly so the
+# ship is visible on the surface for the player. Modern (1.18+) vanilla
+# `/place structure <id>` syntax — pre-1.18 used `/locate` + structure
+# block which is not RCON-friendly.
+SHIPWRECK_STRUCTURE = "minecraft:shipwreck_beached"
+STRUCTURE_FAILURE_SIGNALS = (
+    "Entity not found",
+    "No entity was found",
+    "RCON error",
+    "Failed to parse",
+    "Unknown or incomplete command",
+    "Could not place",
+    "couldn't place",
+    "Cannot place",
+)
+
+
+def cmd_ship(chat_id: int, arg: str, admin_name: str):
+    """Spawn a beached shipwreck (treasure ship) near a target player.
+    Hidden from /help.
+
+    Uses vanilla `place structure` rooted at the player's position with
+    a small (+3, 0, +3) offset so the wreck doesn't pop on top of them.
+    For best visuals the player should stand near a beach or shore —
+    the beached-shipwreck structure is designed for sand terrain and
+    will look odd if forced into a forest or inside walls. Spawned far
+    enough from the player that they can see it appear; spawn-protected
+    chests inside the wreck have the usual shipwreck loot table
+    (emeralds, gold, treasure maps, iron, etc).
+    """
+    toks = arg.strip().split()
+    if not toks:
+        send(chat_id, "Usage: /ship `<player>`")
+        return
+    player = toks[0]
+    if not MC_PROFILE_NAME.match(player):
+        send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
+        return
+    place_cmd = (
+        f"execute at {player} run place structure {SHIPWRECK_STRUCTURE} ~3 ~ ~3"
+    )
+    out = rcon(place_cmd)
+    log.info("ship for %s by %s: %s", player, admin_name, out)
+    pe, ae = md_escape(player), md_escape(admin_name)
+    if any(sig in out for sig in STRUCTURE_FAILURE_SIGNALS):
+        send(chat_id, f"❌ /ship for *{pe}* failed:\n`{md_escape(out[:400])}`")
+        return
+    tail = md_escape(out) if out else "(no output)"
+    send(
+        chat_id,
+        f"🚢 Spawned a beached shipwreck near *{pe}* (by {ae}). "
+        "For the best fit, stand on a sandy shore.\n"
+        f"`{tail}`",
+    )
+
 
 def _give_enchanted_item(
     chat_id: int,
@@ -1831,6 +1888,8 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd in ("/pickaxe", "/pk"):          cmd_pickaxe(chat_id, arg, sender_name)
     # /ts — admin-only turtle-shell helmet giver, also hidden from /help.
     elif cmd == "/ts":                        cmd_turtle_shell(chat_id, arg, sender_name)
+    # /ship — admin-only treasure-shipwreck spawner, also hidden from /help.
+    elif cmd == "/ship":                      cmd_ship(chat_id, arg, sender_name)
     elif cmd in ("/wlreload", "/wlr"):       cmd_whitelist_reload(chat_id, arg, sender_name)
     elif cmd in ("/ban", "/bn"):             cmd_ban(chat_id, arg, sender_name)
     elif cmd in ("/banip", "/bi"):           cmd_banip(chat_id, arg, sender_name)
