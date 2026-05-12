@@ -492,15 +492,40 @@ class HiddenTurtleShellCommandTest(unittest.TestCase):
         # prevents collisions with any future modifier we add.
         self.assertIn('id:"creepwatch:ts_armor"', comp)
 
+    def test_component_uses_bare_list_attribute_modifier_form(self):
+        # Minecraft 1.21.2+ requires a bare list directly after `=`,
+        # NOT `={modifiers:[...]}`. Production hit this with the wrong
+        # form on the live server (DataVersion 4790, April 2026 build)
+        # and got:
+        #   Malformed 'minecraft:attribute_modifiers' component:
+        #   'Not a list: {modifiers:[...]}'
+        # Pin the new form so a copy-paste from older docs cannot
+        # silently regress.
+        comp = mc_guard.TURTLE_SHELL_COMPONENT
+        self.assertIn("minecraft:attribute_modifiers=[", comp)
+        self.assertNotIn("attribute_modifiers={modifiers:", comp)
+
     def test_component_is_well_formed_component_list(self):
         comp = mc_guard.TURTLE_SHELL_COMPONENT
         self.assertTrue(comp.startswith("["))
         self.assertTrue(comp.endswith("]"))
-        # Two components inside the brackets: separated by exactly one comma.
-        # We're not parsing the full SNBT, just guarding against the obvious
-        # "forgot the comma between components" shape error.
+        # Two components inside the brackets: enchantments closes with
+        # `}` then a comma then attribute_modifiers begins with `=[`.
+        # Plain string check — not a full SNBT parse, but catches the
+        # obvious "forgot the comma" shape error.
         inside = comp[1:-1]
-        self.assertIn("},minecraft:attribute_modifiers={", inside)
+        self.assertIn("},minecraft:attribute_modifiers=[", inside)
+
+
+class GiveFailureSignalsTest(unittest.TestCase):
+    """Defensive: the helper has to recognise "Malformed" as a failure.
+    Without it, a data-component validation rejection (e.g. wrong shape
+    after a Minecraft version bump) reaches the user as a fake "✅
+    Gave a turtle helmet" reply while the inventory stays empty.
+    Caught us once on the live server with /ts; pin it."""
+
+    def test_malformed_is_a_give_failure_signal(self):
+        self.assertIn("Malformed", mc_guard.GIVE_FAILURE_SIGNALS)
 
 
 class HiddenTridentCommandTest(unittest.TestCase):
