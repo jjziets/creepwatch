@@ -664,7 +664,15 @@ def _place_structure_near_player(
     the target player via vanilla `place structure`. Mirrors the
     `_give_enchanted_item` helper used by /sword, /pickaxe, /ts: every
     structure command is now a single helper call plus its tuple of
-    (icon, structure_id, offset, label, description, note)."""
+    (icon, structure_id, offset, label, description, note).
+
+    `positioned over world_surface` projects the placement Y onto the
+    topmost block at the player's X/Z before the offset is applied.
+    Without it a player flying at Y=200 gets a floating mansion at Y=200;
+    with it, the structure lands on the terrain directly under them.
+    Tradeoff: a player in a cave can't spawn the structure inside the
+    cave — vanilla treats the outdoor surface as the anchor. Acceptable
+    for the surface-style structures we expose."""
     toks = arg.strip().split()
     if not toks:
         send(chat_id, f"Usage: /{cmd_label} `<player>`")
@@ -673,7 +681,10 @@ def _place_structure_near_player(
     if not MC_PROFILE_NAME.match(player):
         send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
         return
-    place_cmd = f"execute at {player} run place structure {structure_id} {offset}"
+    place_cmd = (
+        f"execute at {player} positioned over world_surface "
+        f"run place structure {structure_id} {offset}"
+    )
     out = rcon(place_cmd)
     log.info("%s for %s by %s: %s", cmd_label, player, admin_name, out)
     pe, ae = md_escape(player), md_escape(admin_name)

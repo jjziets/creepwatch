@@ -265,6 +265,23 @@ class HiddenStructureBatchTest(unittest.TestCase):
                     f"{const_attr} drifted from {expected_id!r}",
                 )
 
+    def test_place_command_projects_onto_world_surface(self):
+        """Without `positioned over world_surface`, a flying player gets a
+        floating-in-the-sky structure at their current altitude. This pins
+        the projection so a future refactor can't silently drop it."""
+        # Mock both rcon (we don't actually want to send to a Minecraft server)
+        # and send (to avoid Telegram round-trips). Then assert that the rcon
+        # invocation carries the projection clause exactly once.
+        with patch.object(mc_guard, "rcon", return_value="ok") as rcon_spy, \
+             patch.object(mc_guard, "send"):
+            mc_guard.cmd_ship(1, "Steve", "Op")
+        rcon_spy.assert_called_once()
+        cmd_sent = rcon_spy.call_args.args[0]
+        self.assertIn("positioned over world_surface", cmd_sent)
+        # And the structure id + offset are still part of the command.
+        self.assertIn("place structure minecraft:shipwreck_beached", cmd_sent)
+        self.assertIn("~3 ~ ~3", cmd_sent)
+
 
 class HiddenShipCommandTest(unittest.TestCase):
     """/ship spawns a beached shipwreck structure near a target player.
