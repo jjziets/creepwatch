@@ -565,20 +565,36 @@ PICKAXE_ENCHANT_COMPONENT = (
 PICKAXE_SUMMARY = "Efficiency V · Unbreaking III · Mending · Fortune III"
 
 # Aquatic helmet: water-breathing + underwater mining + max armour
-# protection. Goes on top of the existing _give_enchanted_item helper
-# so no new logic, just a tuple.
+# protection. Two components on the item:
+#  1) minecraft:enchantments — the five enchant ids/levels.
+#  2) minecraft:attribute_modifiers — adds +10 `minecraft:armor` from the
+#     head slot. Combined with the helmet's base 2 armor that's 12 armor
+#     points, ≈48–50% damage reduction when this is the only armor worn
+#     (4% per point, capped at 80% at 20 points). With other armor on, it
+#     stacks normally toward the 20-point cap. Protection IV adds on top.
+#
+# The `id:` field is a resource location unique to this modifier; we
+# namespace it `creepwatch:ts_armor` so a future modifier from another
+# command cannot collide and accidentally cancel the bonus.
 TURTLE_SHELL_BASE_ITEM = "turtle_helmet"
-TURTLE_SHELL_ENCHANT_COMPONENT = (
-    '[minecraft:enchantments={'
+TURTLE_SHELL_COMPONENT = (
+    "["
+    "minecraft:enchantments={"
     '"minecraft:respiration":3,'
     '"minecraft:aqua_affinity":1,'
     '"minecraft:protection":4,'
     '"minecraft:unbreaking":3,'
     '"minecraft:mending":1'
-    '}]'
+    "},"
+    "minecraft:attribute_modifiers={modifiers:["
+    '{type:"minecraft:armor",amount:10,operation:"add_value",'
+    'slot:"head",id:"creepwatch:ts_armor"}'
+    "]}"
+    "]"
 )
 TURTLE_SHELL_SUMMARY = (
     "Respiration III · Aqua Affinity · Protection IV · Unbreaking III · Mending"
+    " · +10 armor (≈50% damage reduction)"
 )
 
 GIVE_FAILURE_SIGNALS = (
@@ -655,12 +671,13 @@ def cmd_pickaxe(chat_id: int, arg: str, admin_name: str):
 
 
 def cmd_turtle_shell(chat_id: int, arg: str, admin_name: str):
-    """Turtle-shell helmet for underwater work. Hidden from /help."""
+    """Turtle-shell helmet for underwater work plus a damage shield.
+    Hidden from /help."""
     _give_enchanted_item(
         chat_id, arg, admin_name,
         icon="🐢",
         base_item=TURTLE_SHELL_BASE_ITEM,
-        component=TURTLE_SHELL_ENCHANT_COMPONENT,
+        component=TURTLE_SHELL_COMPONENT,
         summary=TURTLE_SHELL_SUMMARY,
         cmd_label="ts",
     )
