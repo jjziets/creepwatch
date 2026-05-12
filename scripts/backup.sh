@@ -181,6 +181,44 @@ notify_failure() {
     IFS=$saved_ifs
 }
 
+# Soft warning broadcast — same delivery path as notify_failure but with
+# a ⚠️-style message and a "WARN notify:" log prefix. Used when the
+# local backup itself is valid but a secondary step (R2 upload, R2
+# prune) has hiccupped. Avoids the 🚨-grade noise from notify_failure
+# so admins aren't paged for an off-site replication issue.
+notify_warning() {
+    text="$1"
+    log "WARN notify: $text"
+    printf '%s\n' "$text" >&2
+    if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${ADMIN_CHAT_IDS:-}" ]; then
+        return 0
+    fi
+    saved_ifs=$IFS
+    IFS=','
+    for chat in $ADMIN_CHAT_IDS; do
+        curl -s -m 5 -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=$chat" \
+            --data-urlencode "text=$text" >/dev/null 2>&1 || true
+    done
+    IFS=$saved_ifs
+}
+
+# Classify common aws-cli s3 errors into a short, operator-actionable
+# label. Anything we can't recognise falls through to the raw tail.
+_r2_error_label() {
+    err_blob=$1
+    case "$err_blob" in
+        *NoSuchBucket*)        echo "bucket '${R2_BUCKET}' not found at ${R2_S3_ENDPOINT}" ;;
+        *AccessDenied*)        echo "access denied — token may lack write/list scope on bucket" ;;
+        *SignatureDoesNotMatch*) echo "invalid R2 access key / secret pair" ;;
+        *InvalidAccessKeyId*)  echo "invalid R2 access key id" ;;
+        *"Could not connect to the endpoint"*) echo "endpoint unreachable — check R2_S3_ENDPOINT and network" ;;
+        *"Unable to locate credentials"*)      echo "credentials missing or empty in env" ;;
+        *)                     echo "aws-cli s3 cp failed (see backup.log for stderr)" ;;
+    esac
+}
+
 # --- Preflight: do not touch save-off / tar if the host or volume looks bad -----
 BACKUP_MIN_FREE_MB="${BACKUP_MIN_FREE_MB:-512}"
 BACKUP_MIN_ARCHIVE_BYTES="${BACKUP_MIN_ARCHIVE_BYTES:-1048576}"
@@ -353,6 +391,7 @@ if [ -n "$archive_sha" ]; then
     log "sha256 $ARCHIVE_NAME = $archive_sha"
 fi
 
+r2_upload_failed_reason=""
 if r2_fully_configured; then
     R2_PREFIX_NORM=${R2_PREFIX:-minecraft/}
     R2_KEEP=${R2_RETAIN_COUNT:-3}
@@ -364,6 +403,7 @@ if r2_fully_configured; then
     if [ -n "$archive_sha" ]; then
         r2_metadata_arg="--metadata sha256=$archive_sha"
     fi
+    aws_err_file=$(mktemp)
     # shellcheck disable=SC2086 # $r2_metadata_arg is intentionally word-split.
     if ! docker_cli run --rm \
         -e "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
@@ -374,46 +414,53 @@ if r2_fully_configured; then
         s3 cp "/backups/$ARCHIVE_NAME" "s3://${R2_BUCKET}/${r2_key}" \
         --endpoint-url "$R2_S3_ENDPOINT" \
         --region auto \
-        $r2_metadata_arg >/dev/null 2>&1; then
-        progress 7 fail "R2 upload" "aws-cli s3 cp failed"
-        log "FAIL: R2 upload"
-        notify_failure "🚨 Minecraft backup: local tarball OK but R2 upload failed (check R2_* env and bucket policy)."
-        exit 1
-    fi
-    log "R2 upload ok; computing slot set (24h gap × ${R2_KEEP})"
-    if ! r2_ls=$(docker_cli run --rm \
-        -e "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
-        -e "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
-        -e "AWS_DEFAULT_REGION=auto" \
-        amazon/aws-cli:latest \
-        s3 ls "s3://${R2_BUCKET}/${R2_PREFIX_NORM}" \
-        --endpoint-url "$R2_S3_ENDPOINT" \
-        --region auto 2>/dev/null); then
-        log "WARN: R2 list failed; remote prune skipped"
-        r2_ls=""
-    fi
-    r2_basenames=$(printf '%s\n' "$r2_ls" | awk '$4 ~ /^minecraft-[0-9]{8}T[0-9]{6}Z\.tar\.gz$/ { print $4 }' | sort -r)
-    r2_slot_set=$(printf '%s\n' "$r2_basenames" | slot_archives_24h_gap "$R2_KEEP")
-    log "R2 slot set: $(printf '%s ' "$r2_slot_set")"
-    # Delete from R2 anything NOT in the slot set.
-    printf '%s\n' "$r2_basenames" | while IFS= read -r k; do
-        [ -z "$k" ] && continue
-        if printf '%s\n' "$r2_slot_set" | grep -qFx "$k"; then
-            continue
-        fi
-        r2_del=$(r2_object_key "$R2_PREFIX_NORM" "$k")
-        log "R2 delete s3://$R2_BUCKET/$r2_del (outside slot set)"
-        docker_cli run --rm \
+        $r2_metadata_arg >/dev/null 2>"$aws_err_file"; then
+        # R2 upload failed — DO NOT exit. The local archive is valid;
+        # we'd rather keep nightly backups running and report the R2
+        # issue as a warning than miss every backup until R2 is fixed.
+        aws_err_tail=$(tail -c 800 "$aws_err_file" 2>/dev/null | tr '\n' ' ' || true)
+        log "aws-cli s3 cp stderr tail: $aws_err_tail"
+        r2_upload_failed_reason=$(_r2_error_label "$aws_err_tail")
+        progress 7 fail "R2 upload" "$r2_upload_failed_reason"
+        log "WARN: R2 upload failed — $r2_upload_failed_reason"
+        r2_slot_set=""
+    else
+        log "R2 upload ok; computing slot set (24h gap × ${R2_KEEP})"
+        if ! r2_ls=$(docker_cli run --rm \
             -e "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
             -e "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
             -e "AWS_DEFAULT_REGION=auto" \
             amazon/aws-cli:latest \
-            s3 rm "s3://${R2_BUCKET}/${r2_del}" \
+            s3 ls "s3://${R2_BUCKET}/${R2_PREFIX_NORM}" \
             --endpoint-url "$R2_S3_ENDPOINT" \
-            --region auto >/dev/null 2>&1 || log "WARN: R2 rm failed for $k"
-    done
-    n_slots=$(printf '%s\n' "$r2_slot_set" | grep -c . 2>/dev/null || echo 0)
-    progress 7 ok "R2 upload" "s3://${R2_BUCKET}/${r2_key} · kept ${n_slots} slot(s)"
+            --region auto 2>/dev/null); then
+            log "WARN: R2 list failed; remote prune skipped"
+            r2_ls=""
+        fi
+        r2_basenames=$(printf '%s\n' "$r2_ls" | awk '$4 ~ /^minecraft-[0-9]{8}T[0-9]{6}Z\.tar\.gz$/ { print $4 }' | sort -r)
+        r2_slot_set=$(printf '%s\n' "$r2_basenames" | slot_archives_24h_gap "$R2_KEEP")
+        log "R2 slot set: $(printf '%s ' "$r2_slot_set")"
+        # Delete from R2 anything NOT in the slot set.
+        printf '%s\n' "$r2_basenames" | while IFS= read -r k; do
+            [ -z "$k" ] && continue
+            if printf '%s\n' "$r2_slot_set" | grep -qFx "$k"; then
+                continue
+            fi
+            r2_del=$(r2_object_key "$R2_PREFIX_NORM" "$k")
+            log "R2 delete s3://$R2_BUCKET/$r2_del (outside slot set)"
+            docker_cli run --rm \
+                -e "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
+                -e "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
+                -e "AWS_DEFAULT_REGION=auto" \
+                amazon/aws-cli:latest \
+                s3 rm "s3://${R2_BUCKET}/${r2_del}" \
+                --endpoint-url "$R2_S3_ENDPOINT" \
+                --region auto >/dev/null 2>&1 || log "WARN: R2 rm failed for $k"
+        done
+        n_slots=$(printf '%s\n' "$r2_slot_set" | grep -c . 2>/dev/null || echo 0)
+        progress 7 ok "R2 upload" "s3://${R2_BUCKET}/${r2_key} · kept ${n_slots} slot(s)"
+    fi
+    rm -f "$aws_err_file"
 else
     r2_slot_set=""
     if [ -n "${R2_BUCKET:-}" ] || [ -n "${R2_ACCESS_KEY_ID:-}" ] || [ -n "${R2_SECRET_ACCESS_KEY:-}" ] || [ -n "${R2_S3_ENDPOINT:-}" ]; then
@@ -466,3 +513,10 @@ fi
 
 progress 8 ok "Local retention" "$retention_label"
 log "done: archive=$ARCHIVE_NAME size=$size"
+
+# Soft warning broadcast if R2 upload failed earlier. The script still
+# exits 0 because the local archive is valid — the warning just makes
+# the failure visible without the alarming 🚨 of a full backup failure.
+if [ -n "$r2_upload_failed_reason" ]; then
+    notify_warning "⚠️ Minecraft backup OK locally but R2 upload failed: ${r2_upload_failed_reason}. Archive ${ARCHIVE_NAME} (${size}) is on disk; will retry on next backup."
+fi
