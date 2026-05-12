@@ -401,6 +401,46 @@ Plain text in this DM relays to in-game chat as `[Admin]`.
 Common aliases: /bu /rs /up /lg /wl /a /rm /bl /ub /ol /ac /st /se /h"""
 
 
+# Cheat-sheet of admin-only commands intentionally absent from HELP_TEXT.
+# Surfaced by /h_h (alias /hh) so an admin can remind themselves of the
+# names without exposing them to non-admins. /h_h itself is also hidden
+# from /help — the menu is only useful if you already know the entry
+# point, and the dispatcher gate already blocks non-admins.
+#
+# Markdown discipline (the HelpTextMarkdownTest applies to HIDDEN_HELP_TEXT
+# too): backtick/asterisk parity even, brackets balanced. `/h\_h` escapes
+# the underscore so Telegram's Markdown parser doesn't try to start an
+# italic span on the `_h` fragment.
+HIDDEN_HELP_TEXT = """🤫 *Hidden admin commands* (admin-only, target `<player>`)
+
+*Gear*
+/sword · /sw — netherite, Sharpness V / Mending / Unbreaking III / Looting III / Sweeping Edge III
+/pickaxe · /pk — netherite, Efficiency V / Unbreaking III / Mending / Fortune III
+/trident · /td — Loyalty III / Impaling V / Channeling / Mending / Unbreaking III
+/bow · /bw — Power V / Punch II / Flame / Infinity / Unbreaking III
+/elytra · /el — Unbreaking III / Mending
+/chestplate · /cp — netherite, Protection IV / Unbreaking III / Mending
+/leggings — netherite, Protection IV / Swift Sneak III / Unbreaking III / Mending
+/boots · /bt — netherite, Protection IV / Feather Falling IV / Depth Strider III / Soul Speed III / Unbreaking III / Mending
+/ts — turtle helmet (Respiration III · Aqua Affinity · Protection IV · Unbreaking III · Mending) + 10 armor ≈ 50% damage reduction
+/totem — Totem of Undying (no enchants)
+
+*Structures (spawn near player)*
+/ship — beached shipwreck (~3 blocks NE)
+/mansion — woodland mansion (~50 NE)
+/buried — single buried treasure chest (~3 NE)
+/ruin — warm ocean ruins (~10 NE)
+/monument — ocean monument (~60 NE)
+/igloo — snowy igloo (~5 NE)
+/portal — ruined portal (biome variant chosen automatically)
+
+*Mob*
+/villager · /vil `<player>` `[1-5]` — spawn villagers next to player
+
+*This menu*
+/h\\_h · /hh"""
+
+
 def cmd_whitelist(chat_id: int):
     out = rcon("whitelist list")
     send(chat_id, f"📋 *Whitelist*\n{md_escape(out)}")
@@ -1824,6 +1864,11 @@ def _tail_log_file(path: pathlib.Path, max_lines: int, max_bytes: int) -> list[s
     return text.splitlines()[-max_lines:]
 
 
+def cmd_hidden_help(chat_id: int):
+    """Send the hidden-commands cheat-sheet. Itself hidden from /help."""
+    send(chat_id, HIDDEN_HELP_TEXT)
+
+
 def cmd_logs(chat_id: int, arg: str):
     """`/logs backup [N]` or `/logs restore [N]` — tail the script log file."""
     parts = arg.split()
@@ -2224,6 +2269,10 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd in ("/backup", "/bu"):          cmd_backup(chat_id, sender_name)
     elif cmd in ("/restore", "/rs"):         cmd_restore(chat_id, arg, sender_name)
     elif cmd in ("/logs", "/lg"):            cmd_logs(chat_id, arg)
+    # /h_h · /hh — hidden cheat-sheet of admin-only commands. Itself absent
+    # from HELP_TEXT, so non-admins don't even see a hint that hidden tools
+    # exist; admins discover it from out-of-band documentation.
+    elif cmd in ("/h_h", "/hh"):             cmd_hidden_help(chat_id)
     elif cmd in ("/update", "/up"):          cmd_update(chat_id, arg, sender_name)
     else:                                     send(chat_id, "Unknown command. Try /help")
 
