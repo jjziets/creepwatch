@@ -429,6 +429,9 @@ HIDDEN_HELP_TEXT = """🤫 *Hidden admin commands* (admin-only, target `<player>
 /ts — turtle helmet (Respiration III · Aqua Affinity · Protection IV · Unbreaking III · Mending) + 10 armor ≈ 50% damage reduction
 /totem — Totem of Undying (no enchants)
 
+*Generic give*
+/give · /gv `<player>` `<item>` `[count]` — give any item id (default count 1)
+
 *Structures (spawn near player)*
 /ship — beached shipwreck (~3 blocks NE)
 /mansion — woodland mansion (~50 NE)
@@ -1096,6 +1099,55 @@ def cmd_turtle_shell(chat_id: int, arg: str, admin_name: str):
         summary=TURTLE_SHELL_SUMMARY,
         cmd_label="ts",
     )
+
+
+def cmd_give(chat_id: int, arg: str, admin_name: str):
+    """Generic `/give` wrapper for handing arbitrary items to a player.
+    Admin-only via the dispatcher gate. Hidden from /help; listed in /h_h.
+
+    Usage: `/give <player> <item> [count]` — count defaults to 1. Item id
+    can be vanilla shorthand (`diamond`) or fully qualified
+    (`minecraft:diamond_sword`); modern Minecraft `give` accepts both.
+
+    The item-id regex deliberately whitelists characters: letters, digits,
+    underscore, colon, slash, dash, dot. Whitespace and shell
+    metacharacters are excluded so a mistyped item can never smuggle a
+    second RCON command via the `give` argument. Failure signals from RCON
+    are surfaced verbatim so the operator sees exactly why the server
+    rejected the item, the player, or the count.
+    """
+    toks = arg.strip().split()
+    if len(toks) < 2:
+        send(chat_id, "Usage: `/give <player> <item> [count]` — e.g. `/give Elite_Eb diamond 32`")
+        return
+    player = toks[0]
+    item = toks[1]
+    count_str = toks[2] if len(toks) > 2 else "1"
+
+    if not MC_PROFILE_NAME.match(player):
+        send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
+        return
+
+    if not re.match(r"^[a-zA-Z0-9_:./-]{1,128}$", item):
+        send(chat_id, f"Invalid item id `{md_escape(item)}` — letters, digits, `_`, `:`, `.`, `/`, `-` only.")
+        return
+
+    try:
+        count = int(count_str)
+        if count < 1:
+            raise ValueError
+    except ValueError:
+        send(chat_id, f"Invalid count `{md_escape(count_str)}` — must be a positive integer.")
+        return
+
+    out = rcon(f"give {player} {item} {count}")
+    log.info("give %s x%d to %s by %s: %s", item, count, player, admin_name, out)
+    pe, ae, ie = md_escape(player), md_escape(admin_name), md_escape(item)
+    if any(sig in out for sig in GIVE_FAILURE_SIGNALS):
+        send(chat_id, f"❌ /give for *{pe}* failed:\n`{md_escape(out[:400])}`")
+        return
+    tail = md_escape(out) if out else "(no output)"
+    send(chat_id, f"🎁 Gave *{pe}* `{count}× {ie}` (by {ae}).\n`{tail}`")
 
 
 def cmd_villager(chat_id: int, arg: str, admin_name: str):
@@ -2262,6 +2314,11 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd == "/totem":                     cmd_totem(chat_id, arg, sender_name)
     # /ts — admin-only turtle-shell helmet giver, also hidden from /help.
     elif cmd == "/ts":                        cmd_turtle_shell(chat_id, arg, sender_name)
+    # /give · /gv — generic item-giver. Admin-only, hidden from /help,
+    # documented in /h_h. Lets admins hand any item id (e.g. cake,
+    # netherite_ingot, minecraft:enchanted_book) without needing a
+    # dedicated /<thing> command per item.
+    elif cmd in ("/give", "/gv"):             cmd_give(chat_id, arg, sender_name)
     # Hidden structure spawners. All admin-only via the dispatcher gate,
     # all absent from HELP_TEXT, all share _place_structure_near_player.
     elif cmd == "/ship":                      cmd_ship(chat_id, arg, sender_name)

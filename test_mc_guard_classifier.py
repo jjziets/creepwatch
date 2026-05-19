@@ -285,6 +285,7 @@ class HiddenHelpMenuTest(unittest.TestCase):
         expected = (
             "/sword", "/pickaxe", "/trident", "/bow", "/elytra",
             "/chestplate", "/leggings", "/boots", "/ts", "/totem",
+            "/give",
             "/ship", "/mansion", "/buried", "/ruin", "/monument",
             "/igloo", "/portal", "/villager",
         )
@@ -633,6 +634,105 @@ class HiddenVillagerCommandTest(unittest.TestCase):
         with patch.object(mc_guard, "cmd_villager") as spy:
             mc_guard.handle_command(1, "/vil Alex", "Op")
             spy.assert_called_once_with(1, "Alex", "Op")
+
+
+class HiddenGiveCommandTest(unittest.TestCase):
+    """`/give` is a generic admin-only item-giver — admins hand any item id
+    to a target player without needing a dedicated /<thing> command per
+    item. Hidden from /help; advertised in /h_h. The character whitelist
+    on the item id is the load-bearing security check — without it, a
+    mistyped item id with a space could smuggle a second RCON command
+    onto the `give` line."""
+
+    def test_help_text_does_not_mention_give_command(self):
+        body = mc_guard.HELP_TEXT.lower()
+        self.assertNotIn("/give", body)
+        self.assertNotIn(" /gv ", body)
+        self.assertFalse(
+            body.rstrip().endswith("/gv"),
+            "trailing '/gv' would reveal the hidden alias",
+        )
+
+    def test_dispatcher_invokes_cmd_give(self):
+        with patch.object(mc_guard, "cmd_give") as spy:
+            mc_guard.handle_command(1, "/give Elite_Eb diamond 32", "Op")
+            spy.assert_called_once_with(1, "Elite_Eb diamond 32", "Op")
+
+    def test_dispatcher_invokes_cmd_give_via_alias(self):
+        with patch.object(mc_guard, "cmd_give") as spy:
+            mc_guard.handle_command(1, "/gv Steve cake", "Op")
+            spy.assert_called_once_with(1, "Steve cake", "Op")
+
+    def test_cmd_give_rejects_missing_item(self):
+        with patch.object(mc_guard, "send") as send_spy, \
+             patch.object(mc_guard, "rcon") as rcon_spy:
+            mc_guard.cmd_give(1, "Elite_Eb", "Op")
+            rcon_spy.assert_not_called()
+            self.assertIn("Usage", send_spy.call_args.args[1])
+
+    def test_cmd_give_rejects_invalid_player_name(self):
+        with patch.object(mc_guard, "send") as send_spy, \
+             patch.object(mc_guard, "rcon") as rcon_spy:
+            mc_guard.cmd_give(1, "Bad@Name diamond", "Op")
+            rcon_spy.assert_not_called()
+            self.assertIn("Invalid player name", send_spy.call_args.args[1])
+
+    def test_cmd_give_rejects_invalid_item_id(self):
+        # A space in the item id is the smuggling vector — `diamond; op @s`
+        # tokenizes into player=Steve, item=diamond;, count=op which then
+        # passes the item-id regex *if it allowed semicolons*. Pin the
+        # regex against this exact shape.
+        with patch.object(mc_guard, "send") as send_spy, \
+             patch.object(mc_guard, "rcon") as rcon_spy:
+            mc_guard.cmd_give(1, "Steve diamond;extra 1", "Op")
+            rcon_spy.assert_not_called()
+            self.assertIn("Invalid item id", send_spy.call_args.args[1])
+
+    def test_cmd_give_rejects_zero_count(self):
+        with patch.object(mc_guard, "send") as send_spy, \
+             patch.object(mc_guard, "rcon") as rcon_spy:
+            mc_guard.cmd_give(1, "Steve diamond 0", "Op")
+            rcon_spy.assert_not_called()
+            self.assertIn("Invalid count", send_spy.call_args.args[1])
+
+    def test_cmd_give_rejects_non_integer_count(self):
+        with patch.object(mc_guard, "send") as send_spy, \
+             patch.object(mc_guard, "rcon") as rcon_spy:
+            mc_guard.cmd_give(1, "Steve diamond seventeen", "Op")
+            rcon_spy.assert_not_called()
+            self.assertIn("Invalid count", send_spy.call_args.args[1])
+
+    def test_cmd_give_default_count_is_one(self):
+        with patch.object(mc_guard, "send"), \
+             patch.object(mc_guard, "rcon", return_value="Gave 1 [Diamond] to Steve") as rcon_spy:
+            mc_guard.cmd_give(1, "Steve diamond", "Op")
+            rcon_spy.assert_called_once_with("give Steve diamond 1")
+
+    def test_cmd_give_passes_qualified_item_id(self):
+        # The dotted/colon-namespaced form (`minecraft:diamond_sword`) is
+        # the canonical id; the shorthand (`diamond`) is the convenience
+        # form. Both must pass the regex.
+        with patch.object(mc_guard, "send"), \
+             patch.object(mc_guard, "rcon", return_value="ok") as rcon_spy:
+            mc_guard.cmd_give(1, "Steve minecraft:diamond_sword 1", "Op")
+            rcon_spy.assert_called_once_with("give Steve minecraft:diamond_sword 1")
+
+    def test_cmd_give_underscored_player_name_works(self):
+        # Issue from production: a player named `Elite_Eb` could not be
+        # given items because there was no /give command at all. This test
+        # pins the underscore-friendly happy path so a future regression
+        # to MC_PROFILE_NAME (e.g. dropping `_`) would fail loudly here
+        # before reaching live admin chat.
+        with patch.object(mc_guard, "send"), \
+             patch.object(mc_guard, "rcon", return_value="Gave 1 [Cake] to Elite_Eb") as rcon_spy:
+            mc_guard.cmd_give(1, "Elite_Eb cake 1", "Op")
+            rcon_spy.assert_called_once_with("give Elite_Eb cake 1")
+
+    def test_cmd_give_surfaces_rcon_failure(self):
+        with patch.object(mc_guard, "send") as send_spy, \
+             patch.object(mc_guard, "rcon", return_value="No entity was found"):
+            mc_guard.cmd_give(1, "Ghost diamond 1", "Op")
+            self.assertIn("failed", send_spy.call_args.args[1])
 
 
 class R2IndicatorTest(unittest.TestCase):
