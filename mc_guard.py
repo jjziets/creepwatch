@@ -6,7 +6,7 @@ Minecraft Whitelist Guard Bot
 - Slash commands for server management
 - Only notifies on actual Minecraft version updates (not routine restarts)
 """
-import contextlib, subprocess, requests, time, re, logging, os, threading, pathlib, json, datetime, tempfile
+import contextlib, subprocess, requests, time, re, logging, os, threading, pathlib, json, datetime, tempfile, math, random
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
@@ -532,6 +532,29 @@ HIDDEN_HELP_TEXT = """🤫 *Hidden admin commands* (admin-only, target `<player>
 # safety, but a small cap prevents fat-finger spam too. The cap is
 # inclusive — count == MAX_SPAWN_COUNT is allowed.
 MAX_SPAWN_COUNT = 10
+
+# Radius from the target player where /spawn lands the mob. A warden on
+# the player's face is one-shot death before they can even read the
+# Telegram message announcing the spawn. 20 blocks is the practical
+# sweet spot: far enough to give them a moment, close enough that the
+# mob's awareness can still pick them up.
+SPAWN_DISTANCE_BLOCKS = 20
+
+
+def _random_spawn_offset(distance: int = SPAWN_DISTANCE_BLOCKS) -> tuple[int, int]:
+    """Return integer (dx, dz) for a point on a circle of `distance`
+    radius around the origin. Random angle every call so a
+    multi-mob /spawn run spreads the spawns around the player
+    instead of stacking them at one bearing. The Y component is
+    handled separately by Minecraft's `positioned over <heightmap>`
+    subcommand at summon time — vanilla can't 'find flat terrain'
+    on the bot side, but heightmap snapping is the closest thing:
+    the mob lands on the top non-leaf solid block at the chosen XZ
+    rather than floating in the air or appearing inside a wall."""
+    angle = random.uniform(0, 2 * math.pi)
+    dx = round(distance * math.cos(angle))
+    dz = round(distance * math.sin(angle))
+    return dx, dz
 
 
 # RCON output signals that mean the `summon` call failed in a way that
@@ -1430,9 +1453,23 @@ def cmd_spawn(chat_id: int, arg: str, admin_name: str):
         send(chat_id, f"Count too high — capped at {MAX_SPAWN_COUNT} per /spawn call.")
         return
 
+    # Each summon picks an independent random bearing so a `count=5`
+    # run scatters the mobs in a rough ring around the player rather
+    # than dropping all five at the same bearing. `positioned over
+    # motion_blocking_no_leaves` is what makes the mob land *on* the
+    # ground at that XZ — without it, summoning at `~dx ~ ~dz`
+    # would copy the player's Y, which is wrong for a player on a
+    # cliff or in a cave.
     last_out = ""
     for i in range(count):
-        out = rcon(f"execute at {player} run summon {mob} ~ ~ ~")
+        dx, dz = _random_spawn_offset()
+        rcon_cmd = (
+            f"execute at {player} "
+            f"positioned ~{dx} ~ ~{dz} "
+            f"positioned over motion_blocking_no_leaves "
+            f"run summon {mob} ~ ~ ~"
+        )
+        out = rcon(rcon_cmd)
         last_out = out
         if any(sig in out for sig in MOB_SPAWN_FAILURE_SIGNALS):
             log.warning("spawn %s aborted at %d/%d near %s by %s: %s",
@@ -1451,7 +1488,11 @@ def cmd_spawn(chat_id: int, arg: str, admin_name: str):
     log.info("spawn %s x%d near %s by %s: %s", mob, count, player, admin_name, last_out)
     pe, me_, ae = md_escape(player), md_escape(mob), md_escape(admin_name)
     tail = md_escape(last_out) if last_out else "(no output)"
-    send(chat_id, f"🧟 Spawned {count}× `{me_}` next to *{pe}* (by {ae}).\n`{tail}`")
+    send(
+        chat_id,
+        f"🧟 Spawned {count}× `{me_}` ~{SPAWN_DISTANCE_BLOCKS} blocks from *{pe}* "
+        f"(random bearing, on surface) by {ae}.\n`{tail}`",
+    )
 
 
 def cmd_warden(chat_id: int, arg: str, admin_name: str):

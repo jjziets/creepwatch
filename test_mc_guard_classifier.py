@@ -995,26 +995,85 @@ class SpawnCommandTest(unittest.TestCase):
             self.assertIn("Count too high", send_spy.call_args.args[1])
 
     def test_cmd_spawn_default_count_is_one(self):
+        # With random.uniform stubbed to 0, dx = round(20*cos(0)) = 20,
+        # dz = round(20*sin(0)) = 0 — the spawn lands 20 blocks east
+        # on the surface (motion_blocking_no_leaves) rather than at
+        # the player's feet.
         with patch.object(mc_guard, "send"), \
+             patch.object(mc_guard.random, "uniform", return_value=0.0), \
              patch.object(mc_guard, "rcon", return_value="Summoned new Warden") as rcon_spy:
             mc_guard.cmd_spawn(1, "Steve warden", "Op")
-            rcon_spy.assert_called_once_with("execute at Steve run summon warden ~ ~ ~")
+            rcon_spy.assert_called_once_with(
+                "execute at Steve positioned ~20 ~ ~0 "
+                "positioned over motion_blocking_no_leaves "
+                "run summon warden ~ ~ ~"
+            )
+
+    def test_cmd_spawn_uses_random_bearing_per_call(self):
+        # angle=π/2 → dx=0, dz=20 (the north bearing). Confirms the
+        # bearing comes from random.uniform — patching it changes
+        # the resulting RCON command, which means real (unpatched)
+        # use scatters mobs around the player.
+        with patch.object(mc_guard, "send"), \
+             patch.object(mc_guard.random, "uniform", return_value=mc_guard.math.pi / 2), \
+             patch.object(mc_guard, "rcon", return_value="Summoned new Warden") as rcon_spy:
+            mc_guard.cmd_spawn(1, "Steve warden 1", "Op")
+            cmd = rcon_spy.call_args.args[0]
+            self.assertIn("positioned ~0 ~ ~20", cmd)
 
     def test_cmd_spawn_underscored_player_name_works(self):
         # Mirrors the /give Elite_Eb regression — owner's son's name
         # contains underscore, the dispatcher must not reject it.
         with patch.object(mc_guard, "send"), \
+             patch.object(mc_guard.random, "uniform", return_value=0.0), \
              patch.object(mc_guard, "rcon", return_value="Summoned new Warden") as rcon_spy:
             mc_guard.cmd_spawn(1, "Elite_Eb warden 1", "Op")
-            rcon_spy.assert_called_once_with("execute at Elite_Eb run summon warden ~ ~ ~")
+            self.assertIn("execute at Elite_Eb", rcon_spy.call_args.args[0])
+            self.assertIn("run summon warden ~ ~ ~", rcon_spy.call_args.args[0])
 
     def test_cmd_spawn_runs_count_summons(self):
         # Each summon is a separate RCON call so the failure path can
-        # bail mid-loop with an accurate progress count.
+        # bail mid-loop with an accurate progress count. Each call
+        # gets its own random bearing.
         with patch.object(mc_guard, "send"), \
+             patch.object(mc_guard.random, "uniform", return_value=0.0), \
              patch.object(mc_guard, "rcon", return_value="Summoned new Cow") as rcon_spy:
             mc_guard.cmd_spawn(1, "Steve cow 3", "Op")
             self.assertEqual(rcon_spy.call_count, 3)
+
+    def test_cmd_spawn_uses_heightmap_for_flat_ground(self):
+        # The "on flat area" requirement: spawn lands on the surface
+        # via `positioned over motion_blocking_no_leaves` instead of
+        # copying the player's Y. Without this, summoning at
+        # `~dx ~ ~dz` would put the mob at the player's altitude —
+        # which is wrong for a player on a cliff, inside a cave, or
+        # high up on a tower.
+        with patch.object(mc_guard, "send"), \
+             patch.object(mc_guard.random, "uniform", return_value=0.0), \
+             patch.object(mc_guard, "rcon", return_value="Summoned new Warden") as rcon_spy:
+            mc_guard.cmd_spawn(1, "Steve warden 1", "Op")
+            self.assertIn(
+                "positioned over motion_blocking_no_leaves",
+                rcon_spy.call_args.args[0],
+            )
+
+    def test_random_spawn_offset_is_on_distance_circle(self):
+        # The (dx, dz) helper outputs points on a circle of
+        # SPAWN_DISTANCE_BLOCKS radius (±1 from integer rounding).
+        # Pinned so a future "double the radius" tweak in one place
+        # doesn't quietly mis-scale the offset somewhere else.
+        for _ in range(50):
+            dx, dz = mc_guard._random_spawn_offset()
+            radius = (dx * dx + dz * dz) ** 0.5
+            self.assertAlmostEqual(
+                radius, mc_guard.SPAWN_DISTANCE_BLOCKS, delta=1.5,
+                msg=f"offset ({dx}, {dz}) is not on the {mc_guard.SPAWN_DISTANCE_BLOCKS}-block circle",
+            )
+
+    def test_spawn_distance_is_twenty_blocks(self):
+        # The user asked for 20 blocks specifically. If someone later
+        # halves it for some reason, the test catches the regression.
+        self.assertEqual(mc_guard.SPAWN_DISTANCE_BLOCKS, 20)
 
     def test_cmd_spawn_unknown_entity_suggests_mobs_command(self):
         rcon_out = "Unknown entity type 'minecraft:wardn'"
