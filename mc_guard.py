@@ -431,6 +431,7 @@ HIDDEN_HELP_TEXT = """🤫 *Hidden admin commands* (admin-only, target `<player>
 
 *Generic give*
 /give · /gv `<player>` `<item>` `[count]` — give any item id (default count 1)
+/items — cheat-sheet of common item ids (item ids are lowercase with underscores)
 
 *Structures (spawn near player)*
 /ship — beached shipwreck (~3 blocks NE)
@@ -446,6 +447,35 @@ HIDDEN_HELP_TEXT = """🤫 *Hidden admin commands* (admin-only, target `<player>
 
 *This menu*
 /h\\_h"""
+
+
+# /items cheat-sheet — Minecraft item ids are lowercase with underscores
+# (`iron_ingot`, not `iron` or `Iron`). The list is intentionally curated
+# rather than exhaustive — a full vanilla registry is ~1500 entries and
+# fits poorly in a Telegram message. Items here are the ones admins
+# actually hand out; the wiki link covers everything else. Same markdown
+# discipline as HIDDEN_HELP_TEXT (balanced backticks / asterisks /
+# brackets) — every item is wrapped in a code span both for readability
+# and so Telegram doesn't try to italicize the underscores.
+ITEMS_HELP_TEXT = """🎁 *Common item IDs* (lowercase, underscores)
+
+*Materials*: `iron_ingot` `gold_ingot` `diamond` `netherite_ingot` `emerald` `copper_ingot` `coal` `charcoal` `redstone` `lapis_lazuli` `quartz` `amethyst_shard` `nether_star` `dragon_egg`
+
+*Food*: `cake` `enchanted_golden_apple` `golden_apple` `bread` `cooked_beef` `cooked_chicken` `cooked_porkchop` `golden_carrot`
+
+*Combat*: `shield` `tnt` `fire_charge` `ender_pearl` `snowball` `arrow` `spectral_arrow` `bow` `crossbow`
+
+*Special*: `totem_of_undying` `elytra` `enchanted_book` `end_crystal` `beacon` `conduit` `respawn_anchor`
+
+*Tools*: `shears` `fishing_rod` `brush` `spyglass` `lead` `name_tag` `compass` `clock`
+
+*Utility blocks*: `chest` `ender_chest` `shulker_box` `hopper` `dispenser` `observer` `piston` `redstone_torch` `repeater` `comparator`
+
+*Buckets*: `water_bucket` `lava_bucket` `milk_bucket` `bucket`
+
+*Wood / stone*: `oak_planks` `oak_log` `cobblestone` `stone` `obsidian` `glass` `glowstone`
+
+Full registry: type `/give @p ` in-game with tab-completion. Wiki: minecraft.wiki/w/Item"""
 
 
 def cmd_whitelist(chat_id: int):
@@ -753,6 +783,15 @@ GIVE_FAILURE_SIGNALS = (
     "Unknown or incomplete command",
     "Failed to parse",
     "Unknown enchantment",
+    # `Unknown item 'minecraft:iron'` — modern Minecraft phrasing when
+    # the item id isn't in the registry. Without this signal, /give
+    # would report "🎁 Gave 32× iron" as success even though RCON
+    # returned the error verbatim. Caught in production via /give
+    # Elite_Eb iron 32 (right name was iron_ingot).
+    "Unknown item",
+    # `Can't find element` — older / alt phrasing for the same class
+    # of registry miss, kept as a defensive belt-and-braces.
+    "Can't find element",
     # `Malformed 'minecraft:<component>' component` — data-component
     # validation rejected the item (e.g. wrong attribute_modifiers
     # shape after a Minecraft version bump). Caught us once with /ts;
@@ -1144,10 +1183,26 @@ def cmd_give(chat_id: int, arg: str, admin_name: str):
     log.info("give %s x%d to %s by %s: %s", item, count, player, admin_name, out)
     pe, ae, ie = md_escape(player), md_escape(admin_name), md_escape(item)
     if any(sig in out for sig in GIVE_FAILURE_SIGNALS):
-        send(chat_id, f"❌ /give for *{pe}* failed:\n`{md_escape(out[:400])}`")
+        msg = f"❌ /give for *{pe}* failed:\n`{md_escape(out[:400])}`"
+        # Hint when the failure is specifically an unknown item id —
+        # the common cause is a player typing `iron` or `Iron` instead
+        # of `iron_ingot`. Point them at /items so they don't have to
+        # ask a second time.
+        if "Unknown item" in out or "Can't find element" in out:
+            msg += "\n\nItem ids are lowercase with underscores. Try `/items` for common ones."
+        send(chat_id, msg)
         return
     tail = md_escape(out) if out else "(no output)"
     send(chat_id, f"🎁 Gave *{pe}* `{count}× {ie}` (by {ae}).\n`{tail}`")
+
+
+def cmd_items(chat_id: int):
+    """Send the curated common-item-id cheat-sheet. Hidden from /help;
+    listed under the *Generic give* section of /h_h. Static text — the
+    bot doesn't query the live Minecraft item registry, so item-set
+    changes after a Minecraft version bump need a manual update here.
+    The wiki link covers the long tail."""
+    send(chat_id, ITEMS_HELP_TEXT)
 
 
 def cmd_villager(chat_id: int, arg: str, admin_name: str):
@@ -2319,6 +2374,11 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     # netherite_ingot, minecraft:enchanted_book) without needing a
     # dedicated /<thing> command per item.
     elif cmd in ("/give", "/gv"):             cmd_give(chat_id, arg, sender_name)
+    # /items — cheat-sheet of common Minecraft item ids. Helper for
+    # /give since item ids are easy to mistype (iron vs iron_ingot).
+    # No short alias by design — /it would collide visually with /ts
+    # (turtle shell) on the keyboard.
+    elif cmd == "/items":                     cmd_items(chat_id)
     # Hidden structure spawners. All admin-only via the dispatcher gate,
     # all absent from HELP_TEXT, all share _place_structure_near_player.
     elif cmd == "/ship":                      cmd_ship(chat_id, arg, sender_name)

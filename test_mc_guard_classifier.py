@@ -285,7 +285,7 @@ class HiddenHelpMenuTest(unittest.TestCase):
         expected = (
             "/sword", "/pickaxe", "/trident", "/bow", "/elytra",
             "/chestplate", "/leggings", "/boots", "/ts", "/totem",
-            "/give",
+            "/give", "/items",
             "/ship", "/mansion", "/buried", "/ruin", "/monument",
             "/igloo", "/portal", "/villager",
         )
@@ -733,6 +733,85 @@ class HiddenGiveCommandTest(unittest.TestCase):
              patch.object(mc_guard, "rcon", return_value="No entity was found"):
             mc_guard.cmd_give(1, "Ghost diamond 1", "Op")
             self.assertIn("failed", send_spy.call_args.args[1])
+
+    def test_give_failure_signals_catch_unknown_item(self):
+        # Caught in production: /give Elite_Eb iron 32 returned "Unknown
+        # item 'minecraft:iron'" from RCON, but the bot reported it as
+        # success ("🎁 Gave 32× iron"). The Unknown-item phrasing has to
+        # be a recognized failure signal so the bot tells the truth.
+        self.assertIn("Unknown item", mc_guard.GIVE_FAILURE_SIGNALS)
+        self.assertIn("Can't find element", mc_guard.GIVE_FAILURE_SIGNALS)
+
+    def test_cmd_give_unknown_item_suggests_items_command(self):
+        rcon_out = "Unknown item 'minecraft:iron' at position 12: ...iron 32<--[HERE]"
+        with patch.object(mc_guard, "send") as send_spy, \
+             patch.object(mc_guard, "rcon", return_value=rcon_out):
+            mc_guard.cmd_give(1, "Elite_Eb iron 32", "Op")
+            body = send_spy.call_args.args[1]
+            # The "failed" line surfaces the raw RCON message, and the
+            # follow-up sentence points the operator at /items so they
+            # don't have to ask a second time how to spell `iron_ingot`.
+            self.assertIn("failed", body)
+            self.assertIn("/items", body)
+
+
+class ItemsHelpCommandTest(unittest.TestCase):
+    """/items sends the curated common-item-id cheat-sheet. Hidden from
+    /help, listed in /h_h. Same markdown discipline as HIDDEN_HELP_TEXT —
+    balanced backticks, asterisks, and brackets — because Telegram
+    rejects unbalanced messages with HTTP 400 and the failure mode is
+    silent (the user sees nothing back). ItemsHelp's cheat-sheet is
+    static; a Minecraft version bump that drops an item id requires a
+    manual edit, but the wiki link covers everything we don't enumerate."""
+
+    def test_items_help_text_has_balanced_code_spans(self):
+        ticks = mc_guard.ITEMS_HELP_TEXT.count("`")
+        self.assertEqual(
+            ticks % 2, 0,
+            f"ITEMS_HELP_TEXT has {ticks} backticks (odd parity) — "
+            "Telegram will reject /items with HTTP 400.",
+        )
+
+    def test_items_help_text_has_balanced_bold(self):
+        stars = mc_guard.ITEMS_HELP_TEXT.count("*")
+        self.assertEqual(
+            stars % 2, 0,
+            f"ITEMS_HELP_TEXT has {stars} asterisks (odd parity) — "
+            "bold spans unbalanced.",
+        )
+
+    def test_items_help_text_has_balanced_brackets(self):
+        self.assertEqual(
+            mc_guard.ITEMS_HELP_TEXT.count("["),
+            mc_guard.ITEMS_HELP_TEXT.count("]"),
+        )
+
+    def test_items_help_text_includes_common_items(self):
+        # Pin a handful of items the operator is most likely to ask
+        # for. If these disappear from the cheat-sheet during a
+        # version-bump edit, the test fails before the cheat-sheet
+        # ships missing the basics.
+        for item in (
+            "iron_ingot", "gold_ingot", "diamond", "netherite_ingot",
+            "totem_of_undying", "elytra", "enchanted_book",
+            "water_bucket", "cake",
+        ):
+            self.assertIn(item, mc_guard.ITEMS_HELP_TEXT,
+                          f"{item} missing from ITEMS_HELP_TEXT")
+
+    def test_items_help_text_includes_wiki_link(self):
+        # The long tail (~1500 vanilla item ids) lives in the wiki;
+        # cheat-sheet curates only ~60. The wiki URL is the safety
+        # net for everything we don't enumerate.
+        self.assertIn("minecraft.wiki", mc_guard.ITEMS_HELP_TEXT)
+
+    def test_dispatcher_invokes_cmd_items(self):
+        with patch.object(mc_guard, "cmd_items") as spy:
+            mc_guard.handle_command(1, "/items", "Op")
+            spy.assert_called_once_with(1)
+
+    def test_help_text_does_not_mention_items_command(self):
+        self.assertNotIn("/items", mc_guard.HELP_TEXT)
 
 
 class R2IndicatorTest(unittest.TestCase):
