@@ -123,6 +123,10 @@ CHEAT_COMMANDS = frozenset((
     "/ship", "/mansion", "/buried", "/ruin", "/monument",
     "/igloo", "/portal",
     "/villager", "/vil",
+    # Mob spawning (added with /spawn / /warden / /mobs).
+    "/spawn",
+    "/warden", "/wd",
+    "/mobs",
 ))
 
 
@@ -515,9 +519,62 @@ HIDDEN_HELP_TEXT = """🤫 *Hidden admin commands* (admin-only, target `<player>
 
 *Mob*
 /villager · /vil `<player>` `[1-5]` — spawn villagers next to player
+/spawn `<player>` `<mob>` `[count]` — summon any entity next to player (cap 10)
+/warden · /wd `<player>` `[count]` — shortcut: summon warden (extremely lethal)
+/mobs — cheat-sheet of common mob ids
 
 *This menu*
 /h\\_h"""
+
+
+# /spawn — cap on the spawn-count argument so /spawn Hannes warden 50
+# doesn't grief the world by accident. The owner gate is the real
+# safety, but a small cap prevents fat-finger spam too. The cap is
+# inclusive — count == MAX_SPAWN_COUNT is allowed.
+MAX_SPAWN_COUNT = 10
+
+
+# RCON output signals that mean the `summon` call failed in a way that
+# matters. Mirrors the GIVE_FAILURE_SIGNALS pattern so future regressions
+# (e.g. a Minecraft version that introduces a new wording for "Unknown
+# entity") are added in one place. /spawn uses this; the older
+# /villager command also implicitly relies on the same shape via its
+# own inline check.
+MOB_SPAWN_FAILURE_SIGNALS = (
+    "Entity not found",
+    "No entity was found",
+    "RCON error",
+    "Unknown or incomplete command",
+    "Failed to parse",
+    # Modern Minecraft phrasing for an unknown entity type
+    # (e.g. `/spawn Hannes wardn 1` → "Unknown entity type 'wardn'").
+    "Unknown entity",
+    # Defensive belt-and-braces — older / alt phrasing.
+    "Can't find element",
+)
+
+
+# /mobs cheat-sheet — Minecraft entity ids are lowercase with underscores
+# (`iron_golem`, not `IronGolem`). Curated rather than exhaustive — the
+# full registry includes ~140 entities and the wiki has the long tail.
+# Same markdown discipline as HIDDEN_HELP_TEXT and ITEMS_HELP_TEXT.
+MOBS_HELP_TEXT = """🧟 *Common mob / entity IDs* (lowercase, underscores)
+
+*Passive*: `villager` `cow` `pig` `sheep` `chicken` `horse` `donkey` `cat` `wolf` `fox` `rabbit` `parrot` `turtle` `axolotl` `bee` `frog` `allay` `camel` `sniffer`
+
+*Neutral*: `iron_golem` `snow_golem` `polar_bear` `panda` `dolphin` `goat` `wandering_trader`
+
+*Hostile (overworld)*: `zombie` `skeleton` `creeper` `spider` `cave_spider` `witch` `enderman` `slime` `husk` `stray` `drowned` `phantom` `pillager` `vindicator` `evoker` `vex` `ravager` `silverfish` `breeze` `bogged`
+
+*Nether*: `blaze` `ghast` `magma_cube` `wither_skeleton` `piglin` `piglin_brute` `zombified_piglin` `hoglin` `zoglin` `strider`
+
+*End*: `endermite` `shulker`
+
+*Bosses / dangerous*: `warden` `wither` `ender_dragon` `elder_guardian`
+
+*Water*: `guardian` `squid` `glow_squid` `tropical_fish` `cod` `salmon` `pufferfish`
+
+Shortcut: `/warden <player>` summons a warden. Full registry: minecraft.wiki/w/Mob"""
 
 
 # /items cheat-sheet — Minecraft item ids are lowercase with underscores
@@ -1331,6 +1388,102 @@ def cmd_villager(chat_id: int, arg: str, admin_name: str):
     pe, ae = md_escape(player), md_escape(admin_name)
     tail = md_escape(last_out) if last_out else "(no output)"
     send(chat_id, f"🧙 Spawned {count} villager(s) next to *{pe}* (by {ae}).\n`{tail}`")
+
+
+def cmd_spawn(chat_id: int, arg: str, admin_name: str):
+    """Generic mob spawner: `/spawn <player> <mob> [count]`. Summons N
+    copies of <mob> at the target player's position via
+    `execute at <player> run summon <mob> ~ ~ ~`. Hidden from /help;
+    listed in /h_h. Owner-gated through CHEAT_COMMANDS.
+
+    Entity-id whitelist mirrors the /give item-id whitelist —
+    `[a-zA-Z0-9_:./-]{1,128}` — so a mistyped mob id with a space or
+    semicolon can never smuggle a second RCON command onto the summon
+    line. Count is capped at MAX_SPAWN_COUNT to prevent fat-finger
+    griefing (10 wardens at once is rough on the world even when the
+    owner asked for it).
+    """
+    toks = arg.strip().split()
+    if len(toks) < 2:
+        send(chat_id, "Usage: `/spawn <player> <mob> [count]` — e.g. `/spawn Elite_Eb warden 1`")
+        return
+    player = toks[0]
+    mob = toks[1]
+    count_str = toks[2] if len(toks) > 2 else "1"
+
+    if not MC_PROFILE_NAME.match(player):
+        send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
+        return
+
+    if not re.match(r"^[a-zA-Z0-9_:./-]{1,128}$", mob):
+        send(chat_id, f"Invalid mob id `{md_escape(mob)}` — letters, digits, `_`, `:`, `.`, `/`, `-` only.")
+        return
+
+    try:
+        count = int(count_str)
+        if count < 1:
+            raise ValueError
+    except ValueError:
+        send(chat_id, f"Invalid count `{md_escape(count_str)}` — must be a positive integer.")
+        return
+    if count > MAX_SPAWN_COUNT:
+        send(chat_id, f"Count too high — capped at {MAX_SPAWN_COUNT} per /spawn call.")
+        return
+
+    last_out = ""
+    for i in range(count):
+        out = rcon(f"execute at {player} run summon {mob} ~ ~ ~")
+        last_out = out
+        if any(sig in out for sig in MOB_SPAWN_FAILURE_SIGNALS):
+            log.warning("spawn %s aborted at %d/%d near %s by %s: %s",
+                        mob, i + 1, count, player, admin_name, out)
+            pe, me_, ae = md_escape(player), md_escape(mob), md_escape(admin_name)
+            msg = (
+                f"❌ Spawn of `{me_}` aborted at {i}/{count} for *{pe}* (by {ae}).\n"
+                f"`{md_escape(out[:400])}`"
+            )
+            # Hint when the cause is specifically an unknown entity id —
+            # parallel to /give's /items suggestion.
+            if "Unknown entity" in out or "Can't find element" in out:
+                msg += "\n\nEntity ids are lowercase with underscores. Try `/mobs` for common ones."
+            send(chat_id, msg)
+            return
+    log.info("spawn %s x%d near %s by %s: %s", mob, count, player, admin_name, last_out)
+    pe, me_, ae = md_escape(player), md_escape(mob), md_escape(admin_name)
+    tail = md_escape(last_out) if last_out else "(no output)"
+    send(chat_id, f"🧟 Spawned {count}× `{me_}` next to *{pe}* (by {ae}).\n`{tail}`")
+
+
+def cmd_warden(chat_id: int, arg: str, admin_name: str):
+    """Convenience: spawn a warden next to <player>. Equivalent to
+    `/spawn <player> warden [count]`. Hidden from /help.
+
+    Wardens one-shot most players through diamond armor and ignore most
+    forms of defense — this is the most lethal vanilla mob. The owner
+    gate is the only thing standing between this and chaos; the count
+    cap inherits MAX_SPAWN_COUNT but realistically nobody should ask
+    for more than 1.
+    """
+    toks = arg.strip().split()
+    if not toks or not toks[0]:
+        send(chat_id, "Usage: `/warden <player> [count]`")
+        return
+    player = toks[0]
+    count = toks[1] if len(toks) > 1 else "1"
+    # Reuse cmd_spawn by composing a synthetic arg string. Keeps the
+    # mob-id validation, count cap, and success/failure formatting in
+    # one place — and means a /spawn bugfix automatically benefits
+    # /warden.
+    cmd_spawn(chat_id, f"{player} warden {count}", admin_name)
+
+
+def cmd_mobs(chat_id: int):
+    """Send the curated common-mob-id cheat-sheet. Hidden from /help;
+    listed under the *Spawn mobs* section of /h_h. Static text — a
+    Minecraft version bump that introduces or removes mobs needs a
+    manual update to MOBS_HELP_TEXT; the wiki link covers the long
+    tail."""
+    send(chat_id, MOBS_HELP_TEXT)
 
 
 def cmd_whitelist_reload(chat_id: int, arg: str, admin_name: str):
@@ -2432,6 +2585,14 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd in ("/msg", "/tell"):            cmd_msg(chat_id, arg, sender_name)
     # /villager · /vil — admin-only, intentionally hidden from /help.
     elif cmd in ("/villager", "/vil"):        cmd_villager(chat_id, arg, sender_name)
+    # /spawn · /warden · /mobs — generic mob spawner + warden shortcut +
+    # entity-id cheat-sheet. Same owner-gate as the rest of the hidden
+    # commands. /wd is the short alias for /warden; /spawn and /mobs
+    # have no short by design (keeps /sp / /mb from colliding with
+    # future /st-style commands).
+    elif cmd == "/spawn":                     cmd_spawn(chat_id, arg, sender_name)
+    elif cmd in ("/warden", "/wd"):           cmd_warden(chat_id, arg, sender_name)
+    elif cmd == "/mobs":                      cmd_mobs(chat_id)
     # /sword · /sw — admin-only god-sword giver, also hidden from /help.
     elif cmd in ("/sword", "/sw"):            cmd_sword(chat_id, arg, sender_name)
     # /pickaxe · /pk — admin-only god-pickaxe giver, also hidden from /help.

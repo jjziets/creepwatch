@@ -288,6 +288,7 @@ class HiddenHelpMenuTest(unittest.TestCase):
             "/give", "/items",
             "/ship", "/mansion", "/buried", "/ruin", "/monument",
             "/igloo", "/portal", "/villager",
+            "/spawn", "/warden", "/mobs",
         )
         for cmd in expected:
             self.assertIn(cmd, mc_guard.HIDDEN_HELP_TEXT,
@@ -798,6 +799,7 @@ class OwnerCheatGateTest(unittest.TestCase):
             "/chestplate", "/leggings", "/boots", "/ts", "/totem",
             "/ship", "/mansion", "/buried", "/ruin", "/monument",
             "/igloo", "/portal", "/villager",
+            "/spawn", "/warden", "/mobs",
         ):
             self.assertIn(cmd, mc_guard.CHEAT_COMMANDS,
                           f"{cmd} appears in HIDDEN_HELP_TEXT but is not in CHEAT_COMMANDS — non-owner admins could use it")
@@ -807,7 +809,7 @@ class OwnerCheatGateTest(unittest.TestCase):
         # gated and /sw is not, an attacker only needs to learn the
         # short form to bypass.
         for short in ("/gv", "/sw", "/pk", "/td", "/bw", "/el", "/cp",
-                      "/bt", "/vil"):
+                      "/bt", "/vil", "/wd"):
             self.assertIn(short, mc_guard.CHEAT_COMMANDS,
                           f"{short} (short alias) must be gated alongside its long form")
 
@@ -918,6 +920,156 @@ class ItemsHelpCommandTest(unittest.TestCase):
 
     def test_help_text_does_not_mention_items_command(self):
         self.assertNotIn("/items", mc_guard.HELP_TEXT)
+
+
+class SpawnCommandTest(unittest.TestCase):
+    """/spawn (generic mob summoner), /warden (lethal shortcut), and
+    /mobs (cheat-sheet). All admin-only via the dispatcher gate AND
+    owner-only via CHEAT_COMMANDS. The mob-id regex is the load-bearing
+    security check — a space or semicolon in the mob id could otherwise
+    smuggle a second RCON command onto the summon line."""
+
+    def test_help_text_does_not_mention_spawn_warden_or_mobs(self):
+        body = mc_guard.HELP_TEXT.lower()
+        self.assertNotIn("/spawn", body)
+        self.assertNotIn("/warden", body)
+        self.assertNotIn("/wd ", body)
+        self.assertNotIn("/mobs", body)
+
+    def test_dispatcher_invokes_cmd_spawn(self):
+        with patch.object(mc_guard, "cmd_spawn") as spy:
+            mc_guard.handle_command(1, "/spawn Elite_Eb warden 1", "Op")
+            spy.assert_called_once_with(1, "Elite_Eb warden 1", "Op")
+
+    def test_dispatcher_invokes_cmd_warden_full_and_alias(self):
+        for cmd in ("/warden Steve", "/wd Steve"):
+            with patch.object(mc_guard, "cmd_warden") as spy:
+                mc_guard.handle_command(1, cmd, "Op")
+                spy.assert_called_once_with(1, "Steve", "Op")
+
+    def test_dispatcher_invokes_cmd_mobs(self):
+        with patch.object(mc_guard, "cmd_mobs") as spy:
+            mc_guard.handle_command(1, "/mobs", "Op")
+            spy.assert_called_once_with(1)
+
+    def test_cmd_spawn_rejects_missing_mob(self):
+        with patch.object(mc_guard, "send") as send_spy, \
+             patch.object(mc_guard, "rcon") as rcon_spy:
+            mc_guard.cmd_spawn(1, "Elite_Eb", "Op")
+            rcon_spy.assert_not_called()
+            self.assertIn("Usage", send_spy.call_args.args[1])
+
+    def test_cmd_spawn_rejects_invalid_player_name(self):
+        with patch.object(mc_guard, "send") as send_spy, \
+             patch.object(mc_guard, "rcon") as rcon_spy:
+            mc_guard.cmd_spawn(1, "Bad@Name warden", "Op")
+            rcon_spy.assert_not_called()
+            self.assertIn("Invalid player name", send_spy.call_args.args[1])
+
+    def test_cmd_spawn_rejects_invalid_mob_id(self):
+        # Same smuggling vector as /give: a semicolon in the mob id
+        # would otherwise tack a second RCON command onto the summon
+        # line. Pin the regex against this exact shape.
+        with patch.object(mc_guard, "send") as send_spy, \
+             patch.object(mc_guard, "rcon") as rcon_spy:
+            mc_guard.cmd_spawn(1, "Steve warden;extra 1", "Op")
+            rcon_spy.assert_not_called()
+            self.assertIn("Invalid mob id", send_spy.call_args.args[1])
+
+    def test_cmd_spawn_rejects_zero_count(self):
+        with patch.object(mc_guard, "send") as send_spy, \
+             patch.object(mc_guard, "rcon") as rcon_spy:
+            mc_guard.cmd_spawn(1, "Steve warden 0", "Op")
+            rcon_spy.assert_not_called()
+            self.assertIn("Invalid count", send_spy.call_args.args[1])
+
+    def test_cmd_spawn_rejects_over_cap_count(self):
+        # 50 wardens at once would lag (and grief) any server. The
+        # MAX_SPAWN_COUNT cap is the fat-finger guard above the
+        # owner gate.
+        over = mc_guard.MAX_SPAWN_COUNT + 1
+        with patch.object(mc_guard, "send") as send_spy, \
+             patch.object(mc_guard, "rcon") as rcon_spy:
+            mc_guard.cmd_spawn(1, f"Steve warden {over}", "Op")
+            rcon_spy.assert_not_called()
+            self.assertIn("Count too high", send_spy.call_args.args[1])
+
+    def test_cmd_spawn_default_count_is_one(self):
+        with patch.object(mc_guard, "send"), \
+             patch.object(mc_guard, "rcon", return_value="Summoned new Warden") as rcon_spy:
+            mc_guard.cmd_spawn(1, "Steve warden", "Op")
+            rcon_spy.assert_called_once_with("execute at Steve run summon warden ~ ~ ~")
+
+    def test_cmd_spawn_underscored_player_name_works(self):
+        # Mirrors the /give Elite_Eb regression — owner's son's name
+        # contains underscore, the dispatcher must not reject it.
+        with patch.object(mc_guard, "send"), \
+             patch.object(mc_guard, "rcon", return_value="Summoned new Warden") as rcon_spy:
+            mc_guard.cmd_spawn(1, "Elite_Eb warden 1", "Op")
+            rcon_spy.assert_called_once_with("execute at Elite_Eb run summon warden ~ ~ ~")
+
+    def test_cmd_spawn_runs_count_summons(self):
+        # Each summon is a separate RCON call so the failure path can
+        # bail mid-loop with an accurate progress count.
+        with patch.object(mc_guard, "send"), \
+             patch.object(mc_guard, "rcon", return_value="Summoned new Cow") as rcon_spy:
+            mc_guard.cmd_spawn(1, "Steve cow 3", "Op")
+            self.assertEqual(rcon_spy.call_count, 3)
+
+    def test_cmd_spawn_unknown_entity_suggests_mobs_command(self):
+        rcon_out = "Unknown entity type 'minecraft:wardn'"
+        with patch.object(mc_guard, "send") as send_spy, \
+             patch.object(mc_guard, "rcon", return_value=rcon_out):
+            mc_guard.cmd_spawn(1, "Steve wardn 1", "Op")
+            body = send_spy.call_args.args[1]
+            self.assertIn("aborted", body)
+            self.assertIn("/mobs", body)
+
+    def test_cmd_warden_defaults_count_to_one(self):
+        # /warden Steve (no count) must summon exactly one warden;
+        # without the default the inner /spawn call would get
+        # `Steve warden ` (trailing space → empty count token).
+        with patch.object(mc_guard, "cmd_spawn") as spy:
+            mc_guard.cmd_warden(1, "Steve", "Op")
+            spy.assert_called_once_with(1, "Steve warden 1", "Op")
+
+    def test_cmd_warden_forwards_count(self):
+        with patch.object(mc_guard, "cmd_spawn") as spy:
+            mc_guard.cmd_warden(1, "Steve 2", "Op")
+            spy.assert_called_once_with(1, "Steve warden 2", "Op")
+
+    def test_cmd_warden_rejects_missing_player(self):
+        with patch.object(mc_guard, "send") as send_spy, \
+             patch.object(mc_guard, "cmd_spawn") as spawn_spy:
+            mc_guard.cmd_warden(1, "", "Op")
+            spawn_spy.assert_not_called()
+            self.assertIn("Usage", send_spy.call_args.args[1])
+
+    def test_mobs_help_text_balanced_markdown(self):
+        # Same parity checks as HIDDEN_HELP_TEXT / ITEMS_HELP_TEXT —
+        # Telegram rejects unbalanced messages with HTTP 400.
+        self.assertEqual(mc_guard.MOBS_HELP_TEXT.count("`") % 2, 0,
+                         "MOBS_HELP_TEXT backticks unbalanced")
+        self.assertEqual(mc_guard.MOBS_HELP_TEXT.count("*") % 2, 0,
+                         "MOBS_HELP_TEXT asterisks unbalanced")
+        self.assertEqual(mc_guard.MOBS_HELP_TEXT.count("["),
+                         mc_guard.MOBS_HELP_TEXT.count("]"))
+
+    def test_mobs_help_text_includes_warden_and_common_mobs(self):
+        # The owner asked specifically for wardens; if a future edit
+        # drops warden from the cheat-sheet the test fails before
+        # the change ships. Plus a few staples.
+        for mob in ("warden", "wither", "ender_dragon", "zombie",
+                    "skeleton", "creeper", "villager", "iron_golem"):
+            self.assertIn(mob, mc_guard.MOBS_HELP_TEXT,
+                          f"{mob} missing from MOBS_HELP_TEXT")
+
+    def test_mob_spawn_failure_signals_catch_unknown_entity(self):
+        # Mirror of the /give "Unknown item" regression: if the bot
+        # doesn't recognize "Unknown entity" as a failure, the wrong
+        # mob id would be reported as a successful spawn.
+        self.assertIn("Unknown entity", mc_guard.MOB_SPAWN_FAILURE_SIGNALS)
+        self.assertIn("Can't find element", mc_guard.MOB_SPAWN_FAILURE_SIGNALS)
 
 
 class R2IndicatorTest(unittest.TestCase):
