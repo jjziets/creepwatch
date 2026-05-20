@@ -755,6 +755,112 @@ class HiddenGiveCommandTest(unittest.TestCase):
             self.assertIn("/items", body)
 
 
+class OwnerCheatGateTest(unittest.TestCase):
+    """OWNER_CHAT_IDS narrows the cheat-tier commands (`/give`, `/h_h`,
+    `/sword`, `/mansion`, `/villager`, …) to a strict subset of admins.
+    Non-owner admins still get the routine commands. The fallback when
+    OWNER_CHAT_IDS is empty is 'every admin gets the cheats', which
+    preserves the existing behavior for deployments that haven't
+    migrated."""
+
+    def test_is_cheat_owner_no_op_when_unset(self):
+        # When OWNER_CHAT_IDS is empty, the cheat gate is a no-op —
+        # every caller passes. The outer admin gate in poll_callbacks
+        # has already filtered non-admins before handle_command runs,
+        # so duplicating the admin check here would only break legit
+        # admin access. The point of the gate is to *narrow* the
+        # admin set when an owner subset is explicitly declared.
+        with patch.object(mc_guard, "OWNER_CHAT_IDS", frozenset()):
+            self.assertTrue(mc_guard.is_cheat_owner(111))
+            self.assertTrue(mc_guard.is_cheat_owner(222))
+            self.assertTrue(mc_guard.is_cheat_owner(333))
+
+    def test_is_cheat_owner_strict_when_set(self):
+        # OWNER_CHAT_IDS narrows to the listed ids only; other admins
+        # are rejected from the cheat tier even though they remain
+        # full admins for the routine commands.
+        with patch.object(mc_guard, "OWNER_CHAT_IDS", frozenset({111})), \
+             patch.object(mc_guard, "ADMIN_IDS", frozenset({111, 222})):
+            self.assertTrue(mc_guard.is_cheat_owner(111))
+            self.assertFalse(mc_guard.is_cheat_owner(222),
+                             "222 is an admin but not an owner — must be denied")
+            self.assertFalse(mc_guard.is_cheat_owner(333))
+
+    def test_cheat_commands_covers_every_hidden_help_entry(self):
+        # The HIDDEN_HELP_TEXT cheat-sheet is the user-visible list of
+        # cheat commands; if a command is advertised there but not
+        # gated, a non-owner admin could discover it from /h_h and use
+        # it. Pin the truth-table so a future addition to the cheat-
+        # sheet automatically forces the gate to grow too.
+        for cmd in (
+            "/give", "/items", "/h_h",
+            "/sword", "/pickaxe", "/trident", "/bow", "/elytra",
+            "/chestplate", "/leggings", "/boots", "/ts", "/totem",
+            "/ship", "/mansion", "/buried", "/ruin", "/monument",
+            "/igloo", "/portal", "/villager",
+        ):
+            self.assertIn(cmd, mc_guard.CHEAT_COMMANDS,
+                          f"{cmd} appears in HIDDEN_HELP_TEXT but is not in CHEAT_COMMANDS — non-owner admins could use it")
+
+    def test_cheat_commands_includes_short_aliases(self):
+        # Aliases share the gate as the long form. If only /sword is
+        # gated and /sw is not, an attacker only needs to learn the
+        # short form to bypass.
+        for short in ("/gv", "/sw", "/pk", "/td", "/bw", "/el", "/cp",
+                      "/bt", "/vil"):
+            self.assertIn(short, mc_guard.CHEAT_COMMANDS,
+                          f"{short} (short alias) must be gated alongside its long form")
+
+    def test_handle_command_refuses_cheat_from_non_owner(self):
+        # 222 is an admin (so they reach handle_command at all) but
+        # not an owner — /give should be refused with the explicit
+        # owner-only message and rcon must never be called.
+        with patch.object(mc_guard, "OWNER_CHAT_IDS", frozenset({111})), \
+             patch.object(mc_guard, "ADMIN_IDS", frozenset({111, 222})), \
+             patch.object(mc_guard, "send") as send_spy, \
+             patch.object(mc_guard, "cmd_give") as give_spy:
+            mc_guard.handle_command(222, "/give Steve diamond 1", "Lourens")
+            give_spy.assert_not_called()
+            send_spy.assert_called_once()
+            self.assertIn("owner", send_spy.call_args.args[1].lower())
+
+    def test_handle_command_allows_cheat_from_owner(self):
+        with patch.object(mc_guard, "OWNER_CHAT_IDS", frozenset({111})), \
+             patch.object(mc_guard, "ADMIN_IDS", frozenset({111, 222})), \
+             patch.object(mc_guard, "cmd_give") as give_spy:
+            mc_guard.handle_command(111, "/give Steve diamond 1", "Hannes")
+            give_spy.assert_called_once_with(111, "Steve diamond 1", "Hannes")
+
+    def test_handle_command_allows_routine_from_non_owner(self):
+        # Routine commands (/online, /whitelist, /kick, …) must still
+        # be reachable by every admin, owner or not — only the cheat
+        # tier is narrowed.
+        with patch.object(mc_guard, "OWNER_CHAT_IDS", frozenset({111})), \
+             patch.object(mc_guard, "ADMIN_IDS", frozenset({111, 222})), \
+             patch.object(mc_guard, "cmd_online") as online_spy:
+            mc_guard.handle_command(222, "/online", "Lourens")
+            online_spy.assert_called_once_with(222)
+
+    def test_owner_chat_ids_parser_rejects_non_positive_ids(self):
+        # Mirror the same defensive check ADMIN_CHAT_IDS gets — a
+        # group/channel id is negative and must never be allowed to
+        # widen the owner gate.
+        with self.assertRaises(SystemExit):
+            mc_guard._parse_optional_owner_ids("-100123")
+        with self.assertRaises(SystemExit):
+            mc_guard._parse_optional_owner_ids("0")
+
+    def test_owner_chat_ids_parser_empty_returns_empty_frozenset(self):
+        self.assertEqual(mc_guard._parse_optional_owner_ids(""), frozenset())
+        self.assertEqual(mc_guard._parse_optional_owner_ids("   "), frozenset())
+
+    def test_owner_chat_ids_parser_accepts_positive_ids(self):
+        self.assertEqual(
+            mc_guard._parse_optional_owner_ids("111,222"),
+            frozenset({111, 222}),
+        )
+
+
 class ItemsHelpCommandTest(unittest.TestCase):
     """/items sends the curated common-item-id cheat-sheet. Hidden from
     /help, listed in /h_h. Same markdown discipline as HIDDEN_HELP_TEXT —

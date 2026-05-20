@@ -54,6 +54,77 @@ def _parse_admin_ids(raw: str) -> list[int]:
 ADMIN_CHAT_IDS = _parse_admin_ids(os.environ["ADMIN_CHAT_IDS"])
 ADMIN_IDS = frozenset(ADMIN_CHAT_IDS)
 
+# Optional second-tier gate above ADMIN_IDS for cheat-style commands
+# (`/give`, `/h_h`, `/sword`, `/mansion`, etc. — every entry in
+# HIDDEN_HELP_TEXT). Owners are the strict subset of admins who are
+# allowed to spawn items / structures / mob; non-owner admins still
+# get the routine commands (`/online`, `/whitelist`, `/kick`, …).
+#
+# Backwards-compatible: when OWNER_CHAT_IDS is unset, fall through to
+# the full ADMIN_IDS set so existing deployments don't suddenly lose
+# access to their hidden commands. Set OWNER_CHAT_IDS=<id> in `.env`
+# (and pass it through docker-compose.yml) to enable the tighter gate.
+def _parse_optional_owner_ids(raw: str) -> frozenset[int]:
+    """Parse the optional OWNER_CHAT_IDS env var. Empty / missing
+    returns an empty frozenset, which is_cheat_owner() reads as
+    'fall back to ADMIN_IDS'. Anything else must be positive
+    private-chat ids — same rules as _parse_admin_ids — so an
+    accidental group id can't widen the gate."""
+    raw = (raw or "").strip()
+    if not raw:
+        return frozenset()
+    ids = [int(x.strip()) for x in raw.split(",") if x.strip()]
+    for i in ids:
+        if i <= 0:
+            raise SystemExit(
+                "OWNER_CHAT_IDS must be positive Telegram user ids (private chat with the bot). "
+                "Negative or zero ids are groups/channels and are not allowed."
+            )
+    return frozenset(ids)
+
+
+OWNER_CHAT_IDS = _parse_optional_owner_ids(os.environ.get("OWNER_CHAT_IDS", ""))
+
+
+def is_cheat_owner(chat_id: int) -> bool:
+    """True when chat_id is allowed to use cheat-tier commands.
+
+    When OWNER_CHAT_IDS is set, the gate is strict: only those ids
+    pass. When OWNER_CHAT_IDS is unset, the gate is a no-op — every
+    caller is allowed through. The outer admin gate in poll_callbacks
+    has already filtered non-admins by the time handle_command runs,
+    so the cheat gate's job is *only* to narrow within the admin set
+    when an owner subset has been declared. This keeps the existing
+    'every admin gets the cheats' behavior the default for any
+    deployment that hasn't migrated."""
+    if not OWNER_CHAT_IDS:
+        return True
+    return chat_id in OWNER_CHAT_IDS
+
+
+# Hidden / cheat-tier commands — items, structures, mobs, the hidden-
+# help menu itself. handle_command gates these through is_cheat_owner()
+# before dispatch. Lives next to HIDDEN_HELP_TEXT in spirit, but defined
+# up here so the gate's truth table is single-source-of-truth and the
+# tests can iterate it directly. Short aliases share the gate as the
+# long form.
+CHEAT_COMMANDS = frozenset((
+    "/h_h",
+    "/give", "/gv", "/items",
+    "/sword", "/sw",
+    "/pickaxe", "/pk",
+    "/trident", "/td",
+    "/bow", "/bw",
+    "/elytra", "/el",
+    "/chestplate", "/cp",
+    "/leggings",
+    "/boots", "/bt",
+    "/totem", "/ts",
+    "/ship", "/mansion", "/buried", "/ruin", "/monument",
+    "/igloo", "/portal",
+    "/villager", "/vil",
+))
+
 
 def telegram_allows_admin_interaction(*, chat_type: str | None, chat_id: int | None, from_id: int | None) -> bool:
     """True only for a private DM with the bot where the sender is a listed admin."""
@@ -2338,6 +2409,15 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     cmd   = parts[0].lower().split("@")[0]
     arg   = parts[1].strip() if len(parts) > 1 else ""
     log.info(f"Command {cmd} from {sender_name} ({chat_id})")
+
+    # Cheat-tier gate: items, structures, mobs, /h_h. Non-owner admins
+    # still get the routine commands further down; only the cheaty ones
+    # are owner-only. The gate sits above the dispatch table so a new
+    # cheat command only has to be added to CHEAT_COMMANDS once.
+    if cmd in CHEAT_COMMANDS and not is_cheat_owner(chat_id):
+        log.info("Cheat command %s refused for chat_id=%s (not in OWNER_CHAT_IDS)", cmd, chat_id)
+        send(chat_id, "⛔ That command is reserved for the server owner.")
+        return
 
     if   cmd in ("/help", "/h"):              send(chat_id, HELP_TEXT)
     elif cmd in ("/whitelist", "/wl"):        cmd_whitelist(chat_id)
