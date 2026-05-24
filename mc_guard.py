@@ -631,7 +631,7 @@ ITEMS_HELP_TEXT = """🎁 *Common item IDs* (lowercase, underscores)
 
 *Tools*: `shears` `fishing_rod` `brush` `spyglass` `lead` `name_tag` `compass` `clock`
 
-*Utility blocks*: `chest` `ender_chest` `shulker_box` `hopper` `dispenser` `observer` `piston` `redstone_torch` `repeater` `comparator`
+*Utility blocks*: `chest` `ender_chest` `shulker_box` `hopper` `dispenser` `observer` `piston` `sticky_piston` `redstone_torch` `repeater` `comparator`
 
 *Buckets*: `water_bucket` `lava_bucket` `milk_bucket` `bucket`
 
