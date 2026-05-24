@@ -368,6 +368,7 @@ class HiddenHelpMenuTest(unittest.TestCase):
             "/ship", "/mansion", "/buried", "/ruin", "/monument",
             "/igloo", "/portal", "/villager",
             "/spawn", "/warden", "/mobs",
+            "/cloak", "/stealthitem",
         )
         for cmd in expected:
             self.assertIn(cmd, mc_guard.HIDDEN_HELP_TEXT,
@@ -387,6 +388,8 @@ class HiddenGenericGiveAndSpawnTest(unittest.TestCase):
         ("/warden Steve", "cmd_warden", (1, "Steve", "Op")),
         ("/wd Steve", "cmd_warden", (1, "Steve", "Op")),
         ("/mobs", "cmd_mobs", (1,)),
+        ("/cloak Steve", "cmd_cloak_item", (1, "Steve", "Op")),
+        ("/stealthitem Steve", "cmd_cloak_item", (1, "Steve", "Op")),
     )
 
     def test_no_generic_cheat_command_leaks_into_help(self):
@@ -429,6 +432,67 @@ class HiddenGenericGiveAndSpawnTest(unittest.TestCase):
 
         rcon_spy.assert_not_called()
         self.assertIn("between 1 and 5", send_spy.call_args.args[1])
+
+
+class CloakHoodTest(unittest.TestCase):
+    def test_cloak_item_is_marked_carved_pumpkin(self):
+        self.assertIn("minecraft:carved_pumpkin", mc_guard.CLOAK_HOOD_ITEM)
+        self.assertIn("Cloak Hood", mc_guard.CLOAK_HOOD_ITEM)
+        self.assertIn(mc_guard.CLOAK_MARKER, mc_guard.CLOAK_HOOD_ITEM)
+
+    def test_cmd_cloak_item_gives_marked_pumpkin(self):
+        with patch.object(mc_guard, "rcon", return_value="Gave 1 [Cloak Hood] to Steve") as rcon_spy, \
+             patch.object(mc_guard, "send") as send_spy:
+            mc_guard.cmd_cloak_item(1, "Steve", "Op")
+
+        rcon_spy.assert_called_once()
+        give_cmd = rcon_spy.call_args.args[0]
+        self.assertTrue(give_cmd.startswith("give Steve minecraft:carved_pumpkin["))
+        self.assertIn(mc_guard.CLOAK_MARKER, give_cmd)
+        self.assertIn("Cloak Hood", send_spy.call_args.args[1])
+
+    def test_cloak_detects_only_marked_pumpkin_in_head_slot(self):
+        head = (
+            'Steve has the following entity data: [{Slot: 103b, id: "minecraft:carved_pumpkin", '
+            'count: 1, components: {"minecraft:custom_data": {creepwatch_cloak: 1b}}}]'
+        )
+        hand = (
+            'Steve has the following entity data: [{Slot: 0b, id: "minecraft:carved_pumpkin", '
+            'count: 1, components: {"minecraft:custom_data": {creepwatch_cloak: 1b}}}]'
+        )
+        unmarked = 'Steve has the following entity data: [{Slot: 103b, id: "minecraft:carved_pumpkin", count: 1}]'
+
+        self.assertTrue(mc_guard._is_cloak_hood_equipped(head))
+        self.assertFalse(mc_guard._is_cloak_hood_equipped(hand))
+        self.assertFalse(mc_guard._is_cloak_hood_equipped(unmarked))
+
+    def test_sync_cloak_state_applies_and_removes_vanilla_hiding(self):
+        calls = []
+        inv_cloaked = (
+            'Steve has the following entity data: [{Slot: 103b, id: "minecraft:carved_pumpkin", '
+            'count: 1, components: {"minecraft:custom_data": {creepwatch_cloak: 1b}}}]'
+        )
+        inv_visible = 'Steve has the following entity data: []'
+
+        def fake_rcon(cmd):
+            calls.append(cmd)
+            if cmd == "data get entity Steve Inventory":
+                return inv_cloaked if calls.count(cmd) == 1 else inv_visible
+            return "ok"
+
+        mc_guard._cloak_seen_state.clear()
+        with patch.object(mc_guard, "rcon", side_effect=fake_rcon):
+            mc_guard._sync_cloak_state_for_players(["Steve"])
+            mc_guard._sync_cloak_state_for_players(["Steve"])
+        mc_guard._cloak_seen_state.clear()
+
+        self.assertIn(f"team join {mc_guard.CLOAK_TEAM} Steve", calls)
+        self.assertIn("attribute Steve minecraft:waypoint_transmit_range base set 0", calls)
+        self.assertIn("team leave Steve", calls)
+        self.assertIn(
+            f"attribute Steve minecraft:waypoint_transmit_range base set {mc_guard.CLOAK_VISIBLE_TRANSMIT_RANGE}",
+            calls,
+        )
 
 
 class HiddenGearBatchTest(unittest.TestCase):

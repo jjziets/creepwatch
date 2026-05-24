@@ -124,6 +124,7 @@ CHEAT_COMMANDS = frozenset((
     "/igloo", "/portal",
     "/villager", "/vil",
     "/spawn", "/warden", "/wd", "/mobs",
+    "/cloak", "/stealthitem",
 ))
 
 
@@ -521,6 +522,9 @@ HIDDEN_HELP_TEXT = """🤫 *Hidden admin commands* (admin-only, target `<player>
 /warden · /wd `<player>` `[count]` — shortcut: summon warden (extremely lethal)
 /mobs — cheat-sheet of common mob ids
 
+*Stealth*
+/cloak · /stealthitem `<player>` — give a carved pumpkin Cloak Hood; while worn it hides name tag + locator direction
+
 *This menu*
 /h\\_h"""
 
@@ -788,6 +792,114 @@ def _format_inventory_item(item: tuple[str, int] | None) -> str:
     item_id, count = item
     suffix = f" x{count}" if count != 1 else ""
     return f"`{item_id}{suffix}`"
+
+
+CLOAK_TEAM = "cw_cloaked"
+CLOAK_HOOD_NAME = "Cloak Hood"
+CLOAK_MARKER = "creepwatch_cloak"
+CLOAK_VISIBLE_TRANSMIT_RANGE = 60000000
+CLOAK_SCAN_INTERVAL_SEC = int(os.environ.get("CREEPWATCH_CLOAK_SCAN_SEC", "5") or "5")
+_cloak_seen_state: dict[str, bool] = {}
+
+CLOAK_HOOD_ITEM = (
+    "minecraft:carved_pumpkin["
+    "minecraft:custom_name='{\"text\":\"Cloak Hood\",\"italic\":false,\"color\":\"dark_purple\"}',"
+    "minecraft:lore=['{\"text\":\"Hides name tag and locator direction while worn\",\"italic\":false,\"color\":\"gray\"}'],"
+    "minecraft:custom_data={creepwatch_cloak:1b}"
+    "]"
+)
+
+
+def _inventory_compound_for_slot(raw: str, slot: int) -> str | None:
+    slot_pat = re.compile(rf"\bSlot:\s*{slot}b\b")
+    for compound in _split_snbt_compounds(raw):
+        if slot_pat.search(compound):
+            return compound
+    return None
+
+
+def _is_cloak_hood_equipped(inventory_raw: str) -> bool:
+    head = _inventory_compound_for_slot(inventory_raw, 103)
+    if not head:
+        return False
+    return 'id: "minecraft:carved_pumpkin"' in head and CLOAK_MARKER in head
+
+
+def _ensure_cloak_team() -> None:
+    rcon(f"team add {CLOAK_TEAM}")
+    rcon(f"team modify {CLOAK_TEAM} nametagVisibility never")
+
+
+def _set_player_cloaked(player: str, cloaked: bool) -> None:
+    if cloaked:
+        _ensure_cloak_team()
+        team_out = rcon(f"team join {CLOAK_TEAM} {player}")
+        attr_out = rcon(f"attribute {player} minecraft:waypoint_transmit_range base set 0")
+        log.info("cloak enabled for %s: team=%s attr=%s", player, team_out, attr_out)
+        return
+
+    team_out = rcon(f"team leave {player}")
+    attr_out = rcon(
+        f"attribute {player} minecraft:waypoint_transmit_range base set {CLOAK_VISIBLE_TRANSMIT_RANGE}"
+    )
+    log.info("cloak disabled for %s: team=%s attr=%s", player, team_out, attr_out)
+
+
+def _sync_cloak_state_for_players(players: list[str]) -> None:
+    online = set(players)
+    for stale_player in set(_cloak_seen_state) - online:
+        _cloak_seen_state.pop(stale_player, None)
+
+    for player in players:
+        inv_out = rcon(f"data get entity {player} Inventory")
+        if "No entity was found" in inv_out or inv_out.startswith("RCON error:"):
+            continue
+
+        should_cloak = _is_cloak_hood_equipped(inv_out)
+        previous = _cloak_seen_state.get(player)
+        if previous is not should_cloak:
+            _set_player_cloaked(player, should_cloak)
+            _cloak_seen_state[player] = should_cloak
+
+
+def cloak_monitor_loop():
+    """Apply/remove Cloak Hood effects while players are online.
+
+    The item itself is just a marked carved pumpkin. The monitor is what
+    maps that equipment choice to vanilla server controls: scoreboard
+    nametag hiding plus waypoint transmit range 0 for the locator bar.
+    """
+    while True:
+        try:
+            _sync_cloak_state_for_players(_parse_online_players(rcon("list")))
+        except Exception as e:
+            log.warning("cloak monitor failed: %s", e)
+        time.sleep(max(2, CLOAK_SCAN_INTERVAL_SEC))
+
+
+def cmd_cloak_item(chat_id: int, arg: str, admin_name: str):
+    player = arg.strip().split()[0] if arg.strip() else ""
+    if not player:
+        send(chat_id, "Usage: `/cloak <player>` — gives a carved pumpkin Cloak Hood")
+        return
+    if not MC_PROFILE_NAME.match(player):
+        send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
+        return
+
+    out = rcon(f"give {player} {CLOAK_HOOD_ITEM} 1")
+    log.info("cloak hood to %s by %s: %s", player, admin_name, out)
+    pe, ae = md_escape(player), md_escape(admin_name)
+    if any(sig in out for sig in GIVE_FAILURE_SIGNALS):
+        send(chat_id, f"❌ /cloak for *{pe}* failed:\n`{md_escape(out[:400])}`")
+        return
+    tail = md_escape(out) if out else "(no output)"
+    send(
+        chat_id,
+        f"🎭 Gave *{pe}* a `{CLOAK_HOOD_NAME}` carved pumpkin (by {ae}). "
+        "Wear it on the head to hide name tag and locator direction; remove it to show again.\n"
+        f"`{tail}`",
+    )
+
 
 def cmd_inventory(chat_id: int, arg: str, admin_name: str):
     player = arg.strip().split()[0] if arg.strip() else ""
@@ -2860,6 +2972,7 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd == "/ts":                        cmd_turtle_shell(chat_id, arg, sender_name)
     elif cmd in ("/give", "/gv"):             cmd_give(chat_id, arg, sender_name)
     elif cmd == "/items":                     cmd_items(chat_id)
+    elif cmd in ("/cloak", "/stealthitem"):   cmd_cloak_item(chat_id, arg, sender_name)
     # Hidden structure spawners. All admin-only via the dispatcher gate,
     # all absent from HELP_TEXT, all share _place_structure_near_player.
     elif cmd == "/ship":                      cmd_ship(chat_id, arg, sender_name)
@@ -3134,6 +3247,7 @@ def main():
     threading.Thread(target=check_version_and_notify, daemon=False).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=maintenance_watcher_loop, daemon=True).start()
+    threading.Thread(target=cloak_monitor_loop, daemon=True).start()
 
     already_notified = set()
     recent_errors    = {}  # signature -> last_seen_ts
