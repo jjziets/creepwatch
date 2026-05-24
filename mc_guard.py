@@ -34,6 +34,7 @@ BACKUP_ARCHIVE_RE = re.compile(r"^minecraft-[0-9]{8}T[0-9]{6}Z\.tar\.gz$")
 BACKUP_TELEGRAM_CHAT_ACTION = "upload_document"
 
 _maintenance_lock = threading.Lock()
+_rcon_lock = threading.Lock()
 _pending_maintenance: dict | None = None
 
 # Comma-separated Telegram *user* ids (same number as a private DM chat id with
@@ -212,7 +213,8 @@ def classify_error(err: str) -> ErrorEvent:
 
 def rcon(cmd: str) -> str:
     try:
-        r = subprocess.run(RCON_CMD + [cmd], capture_output=True, text=True, timeout=10)
+        with _rcon_lock:
+            r = subprocess.run(RCON_CMD + [cmd], capture_output=True, text=True, timeout=10)
         return (r.stdout + r.stderr).strip()
     except Exception as e:
         return f"RCON error: {e}"

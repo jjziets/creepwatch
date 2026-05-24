@@ -86,6 +86,32 @@ class RconCommandGateTest(unittest.TestCase):
         self.assertIsNone(mc_guard.GAMERULE_NAME.match("9bad"))
 
 
+class RconSerializationTest(unittest.TestCase):
+    def test_rcon_runs_under_process_lock(self):
+        events = []
+
+        class RecordingLock:
+            def __enter__(self):
+                events.append("enter")
+
+            def __exit__(self, exc_type, exc, tb):
+                events.append("exit")
+
+        completed = MagicMock()
+        completed.stdout = "ok"
+        completed.stderr = ""
+
+        def fake_run(*_args, **_kwargs):
+            events.append("run")
+            return completed
+
+        with patch.object(mc_guard, "_rcon_lock", RecordingLock()), \
+             patch.object(mc_guard.subprocess, "run", side_effect=fake_run):
+            self.assertEqual("ok", mc_guard.rcon("list"))
+
+        self.assertEqual(["enter", "run", "exit"], events)
+
+
 class TimeCommandTest(unittest.TestCase):
     def test_time_without_args_queries_daytime_and_formats_clock(self):
         with patch.object(mc_guard, "rcon", return_value="The time is 6000") as rcon_spy, \
