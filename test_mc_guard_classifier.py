@@ -715,7 +715,7 @@ class HiddenStructureBatchTest(unittest.TestCase):
         cmd_sent = rcon_spy.call_args.args[0]
         self.assertNotIn("positioned over world_surface", cmd_sent)
         self.assertIn("place structure minecraft:fortress", cmd_sent)
-        self.assertIn("~16 ~ ~16", cmd_sent)
+        self.assertIn("~160 ~ ~160", cmd_sent)
 
 
 class HiddenShipCommandTest(unittest.TestCase):

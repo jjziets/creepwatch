@@ -514,7 +514,7 @@ HIDDEN_HELP_TEXT = """🤫 *Hidden admin commands* (admin-only, target `<player>
 /monument — ocean monument (~60 NE)
 /igloo — snowy igloo (~5 NE)
 /portal — ruined portal (biome variant chosen automatically)
-/fortress · /nf — nether fortress near player (best used in the Nether)
+/fortress · /nf — nether fortress far from player (~160 blocks NE; best used in the Nether)
 
 *Generic give*
 /give · /gv `<player>` `<item>` `[count]` — give any item id (default count 1)
@@ -1491,9 +1491,9 @@ def cmd_fortress(chat_id: int, arg: str, admin_name: str):
         chat_id, arg, admin_name,
         icon="🔥",
         structure_id=NETHER_FORTRESS_STRUCTURE,
-        offset="~16 ~ ~16",
+        offset="~160 ~ ~160",
         cmd_label="fortress",
-        description="a nether fortress ~16 blocks NE",
+        description="a nether fortress ~160 blocks NE",
         note="Best fit: use in the Nether, in a roomy open area. This is a large structure and may clip terrain.",
         project_to_surface=False,
     )
