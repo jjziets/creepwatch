@@ -115,6 +115,44 @@ class TimeCommandTest(unittest.TestCase):
         )
 
 
+class WeatherCommandTest(unittest.TestCase):
+    def test_weather_without_args_reports_current_weather_and_options(self):
+        with patch.object(mc_guard, "current_weather_summary", return_value=("rain", ["rain timer `1200` ticks"])), \
+             patch.object(mc_guard, "rcon", return_value="Gamerule advance_weather is currently set to: true") as rcon_spy, \
+             patch.object(mc_guard, "send") as send_spy:
+            mc_guard.cmd_weather(1, "", "Op")
+
+        rcon_spy.assert_called_once_with("gamerule advance_weather")
+        body = send_spy.call_args.args[1]
+        self.assertIn("Current: `rain`", body)
+        self.assertIn("`/weather clear`", body)
+        self.assertIn("`/weather rain`", body)
+        self.assertIn("`/weather thunder`", body)
+        self.assertIn("rain timer `1200` ticks", body)
+        self.assertIn("advance\\_weather", body)
+
+    def test_weather_summary_prefers_thunder_over_rain(self):
+        raw = (
+            b"\x01\x00\x07raining\x01"
+            b"\x01\x00\nthundering\x01"
+            b"\x03\x00\train_time\x00\x00\x04\xb0"
+            b"\x03\x00\x0cthunder_time\x00\x00\x00d"
+            b"\x03\x00\x12clear_weather_time\x00\x00\x00\x00"
+        )
+        current, details = mc_guard._weather_summary_from_nbt(raw)
+
+        self.assertEqual("thunder", current)
+        self.assertIn("rain timer `1200` ticks", details)
+        self.assertIn("thunder timer `100` ticks", details)
+
+    def test_weather_summary_clear_when_not_raining(self):
+        raw = b"\x01\x00\x07raining\x00\x01\x00\nthundering\x00"
+        current, details = mc_guard._weather_summary_from_nbt(raw)
+
+        self.assertEqual("clear", current)
+        self.assertEqual([], details)
+
+
 class TelegramAdminLockdownTest(unittest.TestCase):
     def test_private_listed_admin_accepted(self):
         self.assertTrue(

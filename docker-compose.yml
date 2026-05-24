@@ -94,6 +94,7 @@ services:
       # the main script so /app/ is a complete python package source dir.
       - ./progress_board.py:/app/progress_board.py
       - ./data:/data
+      - minecraft_data:/minecraft-data:ro
       - ./scripts:/scripts:ro
       - ./backups:/backups:rw
     # tzdata lets Python's ZoneInfo resolve named zones inside the slim image.

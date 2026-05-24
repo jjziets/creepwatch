@@ -7,6 +7,7 @@ Minecraft Whitelist Guard Bot
 - Only notifies on actual Minecraft version updates (not routine restarts)
 """
 import contextlib, subprocess, requests, time, re, logging, os, threading, pathlib, json, datetime, tempfile
+import gzip
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
@@ -278,6 +279,9 @@ TIME_QUERY = frozenset({"day", "daytime", "gametime"})
 TIME_SET_WORD = frozenset({"day", "night", "noon", "midnight"})
 DIFFICULTY = frozenset({"peaceful", "easy", "normal", "hard"})
 WEATHER_KIND = frozenset({"clear", "rain", "thunder"})
+WEATHER_DATA_PATH = pathlib.Path(
+    os.environ.get("CREEPWATCH_WEATHER_DATA_PATH", "/minecraft-data/world/data/minecraft/weather.dat")
+)
 
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
@@ -2005,8 +2009,79 @@ def _minecraft_time_summary(time_query_out: str) -> str:
     return f"Clock: `{hour:02d}:{minute:02d}` ({phase}, `{ticks}` ticks)"
 
 
+def _nbt_named_int(raw: bytes, name: str) -> int | None:
+    needle = b"\x03" + len(name).to_bytes(2, "big") + name.encode("utf-8")
+    idx = raw.find(needle)
+    if idx < 0:
+        return None
+    start = idx + len(needle)
+    if start + 4 > len(raw):
+        return None
+    return int.from_bytes(raw[start:start + 4], "big", signed=True)
+
+
+def _nbt_named_byte(raw: bytes, name: str) -> int | None:
+    needle = b"\x01" + len(name).to_bytes(2, "big") + name.encode("utf-8")
+    idx = raw.find(needle)
+    if idx < 0:
+        return None
+    start = idx + len(needle)
+    if start >= len(raw):
+        return None
+    return int.from_bytes(raw[start:start + 1], "big", signed=True)
+
+
+def _weather_summary_from_nbt(raw: bytes) -> tuple[str, list[str]]:
+    raining = bool(_nbt_named_byte(raw, "raining"))
+    thundering = bool(_nbt_named_byte(raw, "thundering"))
+    rain_time = _nbt_named_int(raw, "rain_time")
+    thunder_time = _nbt_named_int(raw, "thunder_time")
+    clear_time = _nbt_named_int(raw, "clear_weather_time")
+
+    if thundering:
+        current = "thunder"
+    elif raining:
+        current = "rain"
+    else:
+        current = "clear"
+
+    details = []
+    if rain_time is not None:
+        details.append(f"rain timer `{rain_time}` ticks")
+    if thunder_time is not None:
+        details.append(f"thunder timer `{thunder_time}` ticks")
+    if clear_time:
+        details.append(f"clear lock `{clear_time}` ticks")
+    return current, details
+
+
+def current_weather_summary() -> tuple[str, list[str]]:
+    try:
+        raw = gzip.decompress(WEATHER_DATA_PATH.read_bytes())
+    except FileNotFoundError:
+        return "unknown", [f"weather data file not mounted at `{md_escape(str(WEATHER_DATA_PATH))}`"]
+    except Exception as e:
+        return "unknown", [f"could not read weather data: `{md_escape(str(e))}`"]
+    return _weather_summary_from_nbt(raw)
+
+
 def cmd_weather(chat_id: int, arg: str, admin_name: str):
     parts = arg.strip().split()
+    if not parts:
+        current, details = current_weather_summary()
+        cycle = rcon("gamerule advance_weather")
+        lines = [
+            "🌦️ *weather*",
+            f"Current: `{md_escape(current)}`",
+            "Can set: `/weather clear`, `/weather rain`, `/weather thunder` `[seconds]`",
+        ]
+        if details:
+            lines.append("Details: " + "; ".join(details))
+        if cycle and "Incorrect argument" not in cycle and "Unknown or incomplete" not in cycle:
+            lines.append(md_escape(cycle))
+        send(chat_id, "\n".join(lines))
+        return
+
     if len(parts) == 1 and parts[0].lower() in WEATHER_KIND:
         out = rcon(f"weather {parts[0].lower()}")
     elif len(parts) == 2 and parts[0].lower() in WEATHER_KIND:

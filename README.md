@@ -56,7 +56,7 @@ Long form and short alias both work.
 | `/pardon <player>` | `/pd` | Unban name |
 | `/pardonip <target>` | `/pdi` | Unban IP pattern |
 | `/time …` | — | No args shows current day time; `query day|daytime|gametime` or `set day|night|noon|midnight|<ticks>` |
-| `/weather …` | — | `clear` / `rain` / `thunder` [seconds] |
+| `/weather …` | — | No args shows current weather and set options; `clear` / `rain` / `thunder` [seconds] |
 | `/difficulty …` | `/diff` | `peaceful` / `easy` / `normal` / `hard` |
 | `/gamerule …` | `/gr` | Query one rule, or set to `true` / `false` / digits |
 | `/settings` | `/se` | Toggle your own notification categories |
