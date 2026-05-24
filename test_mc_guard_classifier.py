@@ -567,8 +567,13 @@ class CloakHoodTest(unittest.TestCase):
             'count: 1, components: {"minecraft:custom_data": {creepwatch_cloak: 1b}}}]'
         )
         unmarked = 'Steve has the following entity data: [{Slot: 103b, id: "minecraft:carved_pumpkin", count: 1}]'
+        equipment = (
+            'Steve has the following entity data: {head: {count: 1, id: "minecraft:carved_pumpkin", '
+            'components: {"minecraft:custom_data": {creepwatch_cloak: 1b}}}}'
+        )
 
         self.assertTrue(mc_guard._is_cloak_hood_equipped(head))
+        self.assertTrue(mc_guard._is_cloak_hood_equipped("", equipment))
         self.assertFalse(mc_guard._is_cloak_hood_equipped(hand))
         self.assertFalse(mc_guard._is_cloak_hood_equipped(unmarked))
 
@@ -599,6 +604,64 @@ class CloakHoodTest(unittest.TestCase):
             f"attribute Steve minecraft:waypoint_transmit_range base set {mc_guard.CLOAK_VISIBLE_TRANSMIT_RANGE}",
             calls,
         )
+
+
+class InventoryEquipmentTest(unittest.TestCase):
+    def test_parse_equipment_items_from_modern_equipment_field(self):
+        raw = (
+            'Etherion78 has the following entity data: {head: {components: {"minecraft:attribute_modifiers": '
+            '[{amount: 10.0d, id: "creepwatch:ts_armor", slot: "head", type: "minecraft:armor", '
+            'operation: "add_value"}]}, count: 1, id: "minecraft:turtle_helmet"}, '
+            'feet: {count: 1, id: "minecraft:netherite_boots"}, '
+            'chest: {components: {"minecraft:damage": 115}, count: 1, id: "minecraft:iron_chestplate"}, '
+            'legs: {components: {"minecraft:damage": 115}, count: 1, id: "minecraft:iron_leggings"}}'
+        )
+
+        self.assertEqual(
+            {
+                "head": ("minecraft:turtle_helmet", 1),
+                "feet": ("minecraft:netherite_boots", 1),
+                "chest": ("minecraft:iron_chestplate", 1),
+                "legs": ("minecraft:iron_leggings", 1),
+            },
+            mc_guard._parse_equipment_items(raw),
+        )
+
+    def test_inventory_command_displays_equipped_armor_from_equipment_field(self):
+        sent = []
+
+        def fake_rcon(cmd):
+            if cmd == "data get entity Etherion78 Inventory":
+                return (
+                    'Etherion78 has the following entity data: ['
+                    '{count: 1, Slot: 0b, id: "minecraft:netherite_sword"}, '
+                    '{count: 1, Slot: 1b, id: "minecraft:netherite_pickaxe"}, '
+                    '{count: 25, Slot: 8b, id: "minecraft:torch"}]'
+                )
+            if cmd == "data get entity Etherion78 SelectedItemSlot":
+                return "Etherion78 has the following entity data: 1"
+            if cmd == "data get entity Etherion78 equipment":
+                return (
+                    'Etherion78 has the following entity data: {'
+                    'head: {count: 1, id: "minecraft:turtle_helmet"}, '
+                    'chest: {components: {"minecraft:damage": 115}, count: 1, id: "minecraft:iron_chestplate"}, '
+                    'legs: {components: {"minecraft:damage": 115}, count: 1, id: "minecraft:iron_leggings"}, '
+                    'feet: {count: 1, id: "minecraft:netherite_boots"}}'
+                )
+            return ""
+
+        with patch.object(mc_guard, "rcon", side_effect=fake_rcon), \
+             patch.object(mc_guard, "send", side_effect=lambda _, text: sent.append(text)):
+            mc_guard.cmd_inventory(1, "Etherion78", "Op")
+
+        body = sent[-1]
+        self.assertIn("Main hand: `minecraft:netherite_pickaxe` (slot 1)", body)
+        self.assertIn("Head: `minecraft:turtle_helmet`", body)
+        self.assertIn("Chest: `minecraft:iron_chestplate`", body)
+        self.assertIn("Legs: `minecraft:iron_leggings`", body)
+        self.assertIn("Feet: `minecraft:netherite_boots`", body)
+        self.assertIn("Slot 0: `minecraft:netherite_sword`", body)
+        self.assertNotIn("Head: empty", body)
 
 
 class HiddenGearBatchTest(unittest.TestCase):

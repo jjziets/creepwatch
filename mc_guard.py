@@ -778,17 +778,89 @@ def _split_snbt_compounds(raw: str) -> list[str]:
                 item_start = None
     return items
 
+def _parse_inventory_item_compound(compound: str) -> tuple[str, int] | None:
+    id_matches = re.findall(r'\bid:\s*"([^"]+)"', compound)
+    count_m = re.search(r"\bcount:\s*(\d+)", compound)
+    if not id_matches:
+        return None
+    count = int(count_m.group(1)) if count_m else 1
+    return id_matches[-1], count
+
+
 def _parse_inventory_items(raw: str) -> dict[int, tuple[str, int]]:
     items = {}
     for compound in _split_snbt_compounds(raw):
         slot_m = re.search(r"\bSlot:\s*(-?\d+)b", compound)
-        id_m = re.search(r'\bid:\s*"([^"]+)"', compound)
-        count_m = re.search(r"\bcount:\s*(\d+)", compound)
-        if not slot_m or not id_m:
+        item = _parse_inventory_item_compound(compound)
+        if not slot_m or not item:
             continue
         slot = int(slot_m.group(1))
-        count = int(count_m.group(1)) if count_m else 1
-        items[slot] = (id_m.group(1), count)
+        items[slot] = item
+    return items
+
+
+def _split_snbt_keyed_compounds(raw: str) -> dict[str, str]:
+    """Return top-level `key: {compound}` values from an SNBT compound."""
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end <= start:
+        return {}
+    body = raw[start + 1:end]
+    out = {}
+    i = 0
+    n = len(body)
+    while i < n:
+        while i < n and body[i] in " \t\r\n,":
+            i += 1
+        if i >= n:
+            break
+        key_start = i
+        while i < n and body[i] != ":":
+            i += 1
+        if i >= n:
+            break
+        key = body[key_start:i].strip().strip('"')
+        i += 1
+        while i < n and body[i].isspace():
+            i += 1
+        if i >= n or body[i] != "{":
+            while i < n and body[i] != ",":
+                i += 1
+            continue
+
+        value_start = i
+        depth = 0
+        in_string = False
+        escaped = False
+        while i < n:
+            ch = body[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    out[key] = body[value_start:i + 1]
+                    i += 1
+                    break
+            i += 1
+    return out
+
+
+def _parse_equipment_items(raw: str) -> dict[str, tuple[str, int]]:
+    items = {}
+    for key, compound in _split_snbt_keyed_compounds(raw).items():
+        item = _parse_inventory_item_compound(compound)
+        if item:
+            items[key] = item
     return items
 
 def _parse_selected_item_slot(raw: str) -> int | None:
@@ -827,8 +899,10 @@ def _inventory_compound_for_slot(raw: str, slot: int) -> str | None:
     return None
 
 
-def _is_cloak_hood_equipped(inventory_raw: str) -> bool:
-    head = _inventory_compound_for_slot(inventory_raw, 103)
+def _is_cloak_hood_equipped(inventory_raw: str, equipment_raw: str = "") -> bool:
+    head = _split_snbt_keyed_compounds(equipment_raw).get("head")
+    if not head:
+        head = _inventory_compound_for_slot(inventory_raw, 103)
     if not head:
         return False
     return 'id: "minecraft:carved_pumpkin"' in head and CLOAK_MARKER in head
@@ -863,8 +937,11 @@ def _sync_cloak_state_for_players(players: list[str]) -> None:
         inv_out = rcon(f"data get entity {player} Inventory")
         if "No entity was found" in inv_out or inv_out.startswith("RCON error:"):
             continue
+        equipment_out = rcon(f"data get entity {player} equipment")
+        if equipment_out.startswith("RCON error:"):
+            equipment_out = ""
 
-        should_cloak = _is_cloak_hood_equipped(inv_out)
+        should_cloak = _is_cloak_hood_equipped(inv_out, equipment_out)
         previous = _cloak_seen_state.get(player)
         if previous is not should_cloak:
             _set_player_cloaked(player, should_cloak)
@@ -925,24 +1002,25 @@ def cmd_inventory(chat_id: int, arg: str, admin_name: str):
         return
 
     selected_slot = _parse_selected_item_slot(rcon(f"data get entity {player} SelectedItemSlot"))
+    equipment_out = rcon(f"data get entity {player} equipment")
+    equipment = {}
+    if "No entity was found" not in equipment_out and not equipment_out.startswith("RCON error:"):
+        equipment = _parse_equipment_items(equipment_out)
     items = _parse_inventory_items(inv_out)
-    equipment_slots = [
-        ("Main hand", selected_slot),
-        ("Off hand", -106),
-        ("Head", 103),
-        ("Chest", 102),
-        ("Legs", 101),
-        ("Feet", 100),
-    ]
 
     lines = [f"🎒 *Inventory for {md_escape(player)}*", "", "*Equipped*"]
     equipped_slot_values = {-106, 100, 101, 102, 103}
     if selected_slot is not None:
         equipped_slot_values.add(selected_slot)
-    for label, slot in equipment_slots:
-        item = items.get(slot) if slot is not None else None
-        slot_note = f" (slot {slot})" if slot is not None and item else ""
-        lines.append(f"{label}: {_format_inventory_item(item)}{slot_note}")
+
+    main_hand = items.get(selected_slot) if selected_slot is not None else None
+    main_note = f" (slot {selected_slot})" if selected_slot is not None and main_hand else ""
+    lines.append(f"Main hand: {_format_inventory_item(main_hand)}{main_note}")
+    lines.append(f"Off hand: {_format_inventory_item(equipment.get('offhand') or items.get(-106))}")
+    lines.append(f"Head: {_format_inventory_item(equipment.get('head') or items.get(103))}")
+    lines.append(f"Chest: {_format_inventory_item(equipment.get('chest') or items.get(102))}")
+    lines.append(f"Legs: {_format_inventory_item(equipment.get('legs') or items.get(101))}")
+    lines.append(f"Feet: {_format_inventory_item(equipment.get('feet') or items.get(100))}")
 
     carried = [(slot, item) for slot, item in sorted(items.items()) if slot not in equipped_slot_values]
     lines.extend(["", "*Not equipped / carried*"])
