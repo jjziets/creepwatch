@@ -86,6 +86,35 @@ class RconCommandGateTest(unittest.TestCase):
         self.assertIsNone(mc_guard.GAMERULE_NAME.match("9bad"))
 
 
+class TimeCommandTest(unittest.TestCase):
+    def test_time_without_args_queries_daytime_and_formats_clock(self):
+        with patch.object(mc_guard, "rcon", return_value="The time is 6000") as rcon_spy, \
+             patch.object(mc_guard, "send") as send_spy, \
+             patch.object(mc_guard, "notify_event"):
+            mc_guard.cmd_time(1, "", "Op")
+
+        rcon_spy.assert_called_once_with("time query day")
+        body = send_spy.call_args.args[1]
+        self.assertIn("`query day`", body)
+        self.assertIn("Clock: `12:00`", body)
+        self.assertIn("afternoon", body)
+
+    def test_time_query_daytime_alias_uses_supported_day_timeline(self):
+        with patch.object(mc_guard, "rcon", return_value="Timeline minecraft:day is at 18000 tick(s)") as rcon_spy, \
+             patch.object(mc_guard, "send") as send_spy, \
+             patch.object(mc_guard, "notify_event"):
+            mc_guard.cmd_time(1, "query daytime", "Op")
+
+        rcon_spy.assert_called_once_with("time query day")
+        self.assertIn("Clock: `00:00`", send_spy.call_args.args[1])
+
+    def test_time_summary_wraps_minecraft_day(self):
+        self.assertEqual(
+            "Clock: `00:00` (night, `18000` ticks)",
+            mc_guard._minecraft_time_summary("The time is 18000"),
+        )
+
+
 class TelegramAdminLockdownTest(unittest.TestCase):
     def test_private_listed_admin_accepted(self):
         self.assertTrue(

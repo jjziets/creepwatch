@@ -274,7 +274,7 @@ def send_admin_chat_to_minecraft(chat_id: int, message: str, admin_name: str):
 MC_PROFILE_NAME = re.compile(r"^[a-zA-Z0-9_]{1,16}$")
 BANIP_TARGET = re.compile(r"^[a-zA-Z0-9_.:*\-]{1,64}$")
 GAMERULE_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{0,63}$")
-TIME_QUERY = frozenset({"daytime", "gametime", "day"})
+TIME_QUERY = frozenset({"day", "daytime", "gametime"})
 TIME_SET_WORD = frozenset({"day", "night", "noon", "midnight"})
 DIFFICULTY = frozenset({"peaceful", "easy", "normal", "hard"})
 WEATHER_KIND = frozenset({"clear", "rain", "thunder"})
@@ -1942,12 +1942,19 @@ def cmd_pardonip(chat_id: int, arg: str, admin_name: str):
 
 def cmd_time(chat_id: int, arg: str, admin_name: str):
     parts = arg.strip().split()
-    if len(parts) == 2 and parts[0].lower() == "query":
+    q = ""
+    if not parts:
+        q = "day"
+        out = rcon("time query day")
+        detail = "query day"
+    elif len(parts) == 2 and parts[0].lower() == "query":
         q = parts[1].lower()
         if q not in TIME_QUERY:
-            send(chat_id, "`time query` must be: `daytime`, `gametime`, or `day`.")
+            send(chat_id, "`time query` must be: `day`, `daytime`, or `gametime`.")
             return
-        out = rcon(f"time query {q}")
+        query_name = "day" if q == "daytime" else q
+        out = rcon(f"time query {query_name}")
+        detail = " ".join(parts)
     elif len(parts) == 2 and parts[0].lower() == "set":
         raw = parts[1]
         low = raw.lower()
@@ -1962,19 +1969,40 @@ def cmd_time(chat_id: int, arg: str, admin_name: str):
         else:
             send(chat_id, "`time set` needs `day`, `night`, `noon`, `midnight`, or tick digits.")
             return
+        detail = " ".join(parts)
     else:
         send(
             chat_id,
-            "Usage: `/time query daytime|gametime|day` or `/time set day|night|noon|midnight|<ticks>`",
+            "Usage: `/time query day|daytime|gametime` or `/time set day|night|noon|midnight|<ticks>`",
         )
         return
     log.info("time %s by %s", arg.strip(), admin_name)
     ae = md_escape(admin_name)
     tail = md_escape(out) if out else "(no output)"
-    detail = md_escape(" ".join(parts))
-    text = f"🕐 *time* `{detail}` by {ae}\n{tail}"
+    clock = _minecraft_time_summary(out) if q in ("day", "daytime") else ""
+    clock_line = f"\n{clock}" if clock else ""
+    text = f"🕐 *time* `{md_escape(detail)}` by {ae}{clock_line}\n{tail}"
     send(chat_id, text)
     notify_event("approvals", text, exclude=chat_id)
+
+
+def _minecraft_time_summary(time_query_out: str) -> str:
+    m = re.search(r"(-?\d+)", time_query_out)
+    if not m:
+        return ""
+    ticks = int(m.group(1)) % 24000
+    total_minutes = int((ticks * 1440) / 24000)
+    hour = (total_minutes // 60 + 6) % 24
+    minute = total_minutes % 60
+    if 0 <= ticks < 6000:
+        phase = "morning"
+    elif 6000 <= ticks < 12000:
+        phase = "afternoon"
+    elif 12000 <= ticks < 18000:
+        phase = "evening"
+    else:
+        phase = "night"
+    return f"Clock: `{hour:02d}:{minute:02d}` ({phase}, `{ticks}` ticks)"
 
 
 def cmd_weather(chat_id: int, arg: str, admin_name: str):
