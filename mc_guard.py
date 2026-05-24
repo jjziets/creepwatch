@@ -122,7 +122,7 @@ CHEAT_COMMANDS = frozenset((
     "/boots", "/bt",
     "/totem", "/ts",
     "/ship", "/mansion", "/buried", "/ruin", "/monument",
-    "/igloo", "/portal",
+    "/igloo", "/portal", "/fortress", "/nf",
     "/villager", "/vil",
     "/spawn", "/warden", "/wd", "/mobs",
     "/cloak", "/stealthitem",
@@ -514,6 +514,7 @@ HIDDEN_HELP_TEXT = """🤫 *Hidden admin commands* (admin-only, target `<player>
 /monument — ocean monument (~60 NE)
 /igloo — snowy igloo (~5 NE)
 /portal — ruined portal (biome variant chosen automatically)
+/fortress · /nf — nether fortress near player (best used in the Nether)
 
 *Generic give*
 /give · /gv `<player>` `<item>` `[count]` — give any item id (default count 1)
@@ -1311,6 +1312,7 @@ OCEAN_RUIN_STRUCTURE = "minecraft:ocean_ruin_warm"       # sandstone ruins
 MONUMENT_STRUCTURE = "minecraft:monument"                # ocean monument w/ guardians
 IGLOO_STRUCTURE = "minecraft:igloo"                      # snowy igloo w/ optional cellar
 RUINED_PORTAL_STRUCTURE = "minecraft:ruined_portal"      # vanilla picks variant by biome
+NETHER_FORTRESS_STRUCTURE = "minecraft:fortress"         # Nether fortress
 
 STRUCTURE_FAILURE_SIGNALS = (
     "Entity not found",
@@ -1335,6 +1337,7 @@ def _place_structure_near_player(
     cmd_label: str,
     description: str,
     note: str = "",
+    project_to_surface: bool = True,
 ) -> None:
     """Shared body for hidden admin commands that spawn a structure near
     the target player via vanilla `place structure`. Mirrors the
@@ -1342,13 +1345,14 @@ def _place_structure_near_player(
     structure command is now a single helper call plus its tuple of
     (icon, structure_id, offset, label, description, note).
 
-    `positioned over world_surface` projects the placement Y onto the
+    By default, `positioned over world_surface` projects the placement Y onto the
     topmost block at the player's X/Z before the offset is applied.
     Without it a player flying at Y=200 gets a floating mansion at Y=200;
     with it, the structure lands on the terrain directly under them.
     Tradeoff: a player in a cave can't spawn the structure inside the
     cave — vanilla treats the outdoor surface as the anchor. Acceptable
-    for the surface-style structures we expose."""
+    for the surface-style structures we expose. Nether structures disable
+    that projection so they don't snap to the Nether roof."""
     toks = arg.strip().split()
     if not toks:
         send(chat_id, f"Usage: /{cmd_label} `<player>`")
@@ -1357,10 +1361,8 @@ def _place_structure_near_player(
     if not MC_PROFILE_NAME.match(player):
         send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
         return
-    place_cmd = (
-        f"execute at {player} positioned over world_surface "
-        f"run place structure {structure_id} {offset}"
-    )
+    projection = "positioned over world_surface " if project_to_surface else ""
+    place_cmd = f"execute at {player} {projection}run place structure {structure_id} {offset}"
     out = rcon(place_cmd)
     log.info("%s for %s by %s: %s", cmd_label, player, admin_name, out)
     pe, ae = md_escape(player), md_escape(admin_name)
@@ -1475,6 +1477,25 @@ def cmd_portal(chat_id: int, arg: str, admin_name: str):
         cmd_label="portal",
         description="a ruined nether portal",
         note="Vanilla picks the variant matching the surrounding biome.",
+    )
+
+
+def cmd_fortress(chat_id: int, arg: str, admin_name: str):
+    """Nether fortress. Hidden from /help.
+
+    This intentionally does not use `positioned over world_surface`;
+    in the Nether that can project to the bedrock roof instead of the
+    player's usable cavern height.
+    """
+    _place_structure_near_player(
+        chat_id, arg, admin_name,
+        icon="🔥",
+        structure_id=NETHER_FORTRESS_STRUCTURE,
+        offset="~16 ~ ~16",
+        cmd_label="fortress",
+        description="a nether fortress ~16 blocks NE",
+        note="Best fit: use in the Nether, in a roomy open area. This is a large structure and may clip terrain.",
+        project_to_surface=False,
     )
 
 
@@ -3085,6 +3106,7 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd == "/monument":                  cmd_monument(chat_id, arg, sender_name)
     elif cmd == "/igloo":                     cmd_igloo(chat_id, arg, sender_name)
     elif cmd == "/portal":                    cmd_portal(chat_id, arg, sender_name)
+    elif cmd in ("/fortress", "/nf"):         cmd_fortress(chat_id, arg, sender_name)
     elif cmd in ("/wlreload", "/wlr"):       cmd_whitelist_reload(chat_id, arg, sender_name)
     elif cmd in ("/ban", "/bn"):             cmd_ban(chat_id, arg, sender_name)
     elif cmd in ("/banip", "/bi"):           cmd_banip(chat_id, arg, sender_name)

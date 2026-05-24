@@ -433,7 +433,7 @@ class HiddenHelpMenuTest(unittest.TestCase):
             "/sword", "/pickaxe", "/trident", "/bow", "/elytra",
             "/chestplate", "/leggings", "/boots", "/ts", "/totem",
             "/ship", "/mansion", "/buried", "/ruin", "/monument",
-            "/igloo", "/portal", "/villager",
+            "/igloo", "/portal", "/fortress", "/nf", "/villager",
             "/spawn", "/warden", "/mobs",
             "/cloak", "/stealthitem",
         )
@@ -659,6 +659,7 @@ class HiddenStructureBatchTest(unittest.TestCase):
         ("/monument", "cmd_monument", "MONUMENT_STRUCTURE",        "minecraft:monument"),
         ("/igloo",    "cmd_igloo",    "IGLOO_STRUCTURE",           "minecraft:igloo"),
         ("/portal",   "cmd_portal",   "RUINED_PORTAL_STRUCTURE",   "minecraft:ruined_portal"),
+        ("/fortress", "cmd_fortress", "NETHER_FORTRESS_STRUCTURE", "minecraft:fortress"),
     )
 
     def test_no_new_structure_command_leaks_into_help(self):
@@ -672,6 +673,11 @@ class HiddenStructureBatchTest(unittest.TestCase):
                 with patch.object(mc_guard, fn_attr) as spy:
                     mc_guard.handle_command(1, f"{cmd_text} Steve", "Op")
                     spy.assert_called_once_with(1, "Steve", "Op")
+
+    def test_dispatcher_routes_fortress_alias(self):
+        with patch.object(mc_guard, "cmd_fortress") as spy:
+            mc_guard.handle_command(1, "/nf Steve", "Op")
+            spy.assert_called_once_with(1, "Steve", "Op")
 
     def test_structure_registry_ids_are_pinned(self):
         for cmd_text, _fn, const_attr, expected_id in self.CASES:
@@ -698,6 +704,18 @@ class HiddenStructureBatchTest(unittest.TestCase):
         # And the structure id + offset are still part of the command.
         self.assertIn("place structure minecraft:shipwreck_beached", cmd_sent)
         self.assertIn("~3 ~ ~3", cmd_sent)
+
+    def test_fortress_does_not_project_to_world_surface(self):
+        """Nether fortress placement should stay at the player's cavern Y.
+        Projecting to world_surface in the Nether can land on the roof."""
+        with patch.object(mc_guard, "rcon", return_value="ok") as rcon_spy, \
+             patch.object(mc_guard, "send"):
+            mc_guard.cmd_fortress(1, "Steve", "Op")
+        rcon_spy.assert_called_once()
+        cmd_sent = rcon_spy.call_args.args[0]
+        self.assertNotIn("positioned over world_surface", cmd_sent)
+        self.assertIn("place structure minecraft:fortress", cmd_sent)
+        self.assertIn("~16 ~ ~16", cmd_sent)
 
 
 class HiddenShipCommandTest(unittest.TestCase):
