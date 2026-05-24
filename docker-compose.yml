@@ -59,6 +59,10 @@ services:
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - ADMIN_CHAT_IDS=${ADMIN_CHAT_IDS}
+      # Optional: comma-separated subset of ADMIN_CHAT_IDS allowed to use
+      # cheat commands (/give, /h_h, /sword, /mansion, etc.). When empty,
+      # all admins can use cheats (backwards-compatible).
+      - OWNER_CHAT_IDS=${OWNER_CHAT_IDS:-}
       - TZ=${TZ:-UTC}
       # For /update: set to host deploy dir and mount that path read-only below.
       - CREEPWATCH_PROJECT_DIR=${CREEPWATCH_PROJECT_DIR:-}

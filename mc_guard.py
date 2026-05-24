@@ -380,7 +380,7 @@ TOGGLE_KEYS = ("joins", "leaves", "approvals", "rejects", "restarts", "errors", 
 
 HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
 
-*Players*  /online · /activity · /status
+*Players*  /online · /activity · /status · /inventory `<p>`
 /kick `<p>` `[r]` · /msg `<p>` `<m>` · /ban `<p>` `[r]` · /pardon `<p>` · /banip `<t>` · /pardonip `<t>`
 
 *Whitelist & blocks*
@@ -398,7 +398,7 @@ HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
 /settings — toggle which events ping you (joins, leaves, errors, chat, …)
 
 Plain text in this DM relays to in-game chat as `[Admin]`.
-Common aliases: /bu /rs /up /lg /wl /a /rm /bl /ub /ol /ac /st /se /h"""
+Common aliases: /bu /rs /up /lg /wl /a /rm /bl /ub /ol /ac /st /inv /se /h"""
 
 
 # Cheat-sheet of admin-only commands intentionally absent from HELP_TEXT.
@@ -474,6 +474,118 @@ def cmd_approve(chat_id: int, player: str, admin_name: str):
 def cmd_online(chat_id: int):
     out = rcon("list")
     send(chat_id, f"👥 *Online players*\n{md_escape(out)}")
+
+    if ":" not in out:
+        return
+    players = [p.strip() for p in out.rsplit(":", 1)[1].split(",") if p.strip()]
+    for player in players:
+        send(chat_id, f"`{md_escape(player)}`")
+
+def _split_snbt_compounds(raw: str) -> list[str]:
+    """Return top-level item compounds from a Minecraft SNBT list."""
+    start = raw.find("[")
+    end = raw.rfind("]")
+    if start < 0 or end <= start:
+        return []
+    body = raw[start + 1:end]
+    items = []
+    depth = 0
+    in_string = False
+    escaped = False
+    item_start = None
+    for i, ch in enumerate(body):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                item_start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and item_start is not None:
+                items.append(body[item_start:i + 1])
+                item_start = None
+    return items
+
+def _parse_inventory_items(raw: str) -> dict[int, tuple[str, int]]:
+    items = {}
+    for compound in _split_snbt_compounds(raw):
+        slot_m = re.search(r"\bSlot:\s*(-?\d+)b", compound)
+        id_m = re.search(r'\bid:\s*"([^"]+)"', compound)
+        count_m = re.search(r"\bcount:\s*(\d+)", compound)
+        if not slot_m or not id_m:
+            continue
+        slot = int(slot_m.group(1))
+        count = int(count_m.group(1)) if count_m else 1
+        items[slot] = (id_m.group(1), count)
+    return items
+
+def _parse_selected_item_slot(raw: str) -> int | None:
+    m = re.search(r"entity data:\s*(-?\d+)", raw)
+    return int(m.group(1)) if m else None
+
+def _format_inventory_item(item: tuple[str, int] | None) -> str:
+    if not item:
+        return "empty"
+    item_id, count = item
+    suffix = f" x{count}" if count != 1 else ""
+    return f"`{item_id}{suffix}`"
+
+def cmd_inventory(chat_id: int, arg: str, admin_name: str):
+    player = arg.strip().split()[0] if arg.strip() else ""
+    if not player:
+        send(chat_id, "Usage: `/inventory <player>` — e.g. `/inventory Elite_Eb`")
+        return
+    if not MC_PROFILE_NAME.match(player):
+        send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
+        return
+
+    inv_out = rcon(f"data get entity {player} Inventory")
+    if "No entity was found" in inv_out or "Found no elements" in inv_out or inv_out.startswith("RCON error:"):
+        send(chat_id, f"❌ Could not read inventory for *{md_escape(player)}*:\n`{md_escape(inv_out[:800])}`")
+        return
+
+    selected_slot = _parse_selected_item_slot(rcon(f"data get entity {player} SelectedItemSlot"))
+    items = _parse_inventory_items(inv_out)
+    equipment_slots = [
+        ("Main hand", selected_slot),
+        ("Off hand", -106),
+        ("Head", 103),
+        ("Chest", 102),
+        ("Legs", 101),
+        ("Feet", 100),
+    ]
+
+    lines = [f"🎒 *Inventory for {md_escape(player)}*", "", "*Equipped*"]
+    equipped_slot_values = {-106, 100, 101, 102, 103}
+    if selected_slot is not None:
+        equipped_slot_values.add(selected_slot)
+    for label, slot in equipment_slots:
+        item = items.get(slot) if slot is not None else None
+        slot_note = f" (slot {slot})" if slot is not None and item else ""
+        lines.append(f"{label}: {_format_inventory_item(item)}{slot_note}")
+
+    carried = [(slot, item) for slot, item in sorted(items.items()) if slot not in equipped_slot_values]
+    lines.extend(["", "*Not equipped / carried*"])
+    if carried:
+        for slot, item in carried:
+            lines.append(f"Slot {slot}: {_format_inventory_item(item)}")
+    else:
+        lines.append("empty")
+
+    body = "\n".join(lines)
+    if len(body) > 3900:
+        body = body[:3800] + "\n…truncated"
+    log.info("inventory read for %s by %s: %d item slots", player, admin_name, len(items))
+    send(chat_id, body)
 
 def cmd_activity(chat_id: int):
     try:
@@ -2241,6 +2353,7 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd in ("/online", "/ol"):           cmd_online(chat_id)
     elif cmd in ("/activity", "/ac"):         cmd_activity(chat_id)
     elif cmd in ("/status", "/st"):           cmd_status(chat_id)
+    elif cmd in ("/inventory", "/inv"):       cmd_inventory(chat_id, arg, sender_name)
     elif cmd in ("/kick", "/k"):              cmd_kick(chat_id, arg, sender_name)
     elif cmd in ("/msg", "/tell"):            cmd_msg(chat_id, arg, sender_name)
     # /villager · /vil — admin-only, intentionally hidden from /help.
