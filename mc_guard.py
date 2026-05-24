@@ -54,6 +54,78 @@ def _parse_admin_ids(raw: str) -> list[int]:
 ADMIN_CHAT_IDS = _parse_admin_ids(os.environ["ADMIN_CHAT_IDS"])
 ADMIN_IDS = frozenset(ADMIN_CHAT_IDS)
 
+# Optional second-tier gate above ADMIN_IDS for cheat-style commands
+# (`/give`, `/h_h`, `/sword`, `/mansion`, etc. — every entry in
+# HIDDEN_HELP_TEXT). Owners are the strict subset of admins who are
+# allowed to spawn items / structures / mob; non-owner admins still
+# get the routine commands (`/online`, `/whitelist`, `/kick`, …).
+#
+# Backwards-compatible: when OWNER_CHAT_IDS is unset, fall through to
+# the full ADMIN_IDS set so existing deployments don't suddenly lose
+# access to their hidden commands. Set OWNER_CHAT_IDS=<id> in `.env`
+# (and pass it through docker-compose.yml) to enable the tighter gate.
+def _parse_optional_owner_ids(raw: str) -> frozenset[int]:
+    """Parse the optional OWNER_CHAT_IDS env var. Empty / missing
+    returns an empty frozenset, which is_cheat_owner() reads as
+    'fall back to ADMIN_IDS'. Anything else must be positive
+    private-chat ids — same rules as _parse_admin_ids — so an
+    accidental group id can't widen the gate."""
+    raw = (raw or "").strip()
+    if not raw:
+        return frozenset()
+    ids = [int(x.strip()) for x in raw.split(",") if x.strip()]
+    for i in ids:
+        if i <= 0:
+            raise SystemExit(
+                "OWNER_CHAT_IDS must be positive Telegram user ids (private chat with the bot). "
+                "Negative or zero ids are groups/channels and are not allowed."
+            )
+    return frozenset(ids)
+
+
+OWNER_CHAT_IDS = _parse_optional_owner_ids(os.environ.get("OWNER_CHAT_IDS", ""))
+
+
+def is_cheat_owner(chat_id: int) -> bool:
+    """True when chat_id is allowed to use cheat-tier commands.
+
+    When OWNER_CHAT_IDS is set, the gate is strict: only those ids
+    pass. When OWNER_CHAT_IDS is unset, the gate is a no-op — every
+    caller is allowed through. The outer admin gate in poll_callbacks
+    has already filtered non-admins by the time handle_command runs,
+    so the cheat gate's job is *only* to narrow within the admin set
+    when an owner subset has been declared. This keeps the existing
+    'every admin gets the cheats' behavior the default for any
+    deployment that hasn't migrated."""
+    if not OWNER_CHAT_IDS:
+        return True
+    return chat_id in OWNER_CHAT_IDS
+
+
+# Hidden / cheat-tier commands — items, structures, mobs, the hidden-
+# help menu itself. handle_command gates these through is_cheat_owner()
+# before dispatch. Lives next to HIDDEN_HELP_TEXT in spirit, but defined
+# up here so the gate's truth table is single-source-of-truth and the
+# tests can iterate it directly. Short aliases share the gate as the
+# long form.
+CHEAT_COMMANDS = frozenset((
+    "/h_h",
+    "/give", "/gv", "/items",
+    "/sword", "/sw",
+    "/pickaxe", "/pk",
+    "/trident", "/td",
+    "/bow", "/bw",
+    "/elytra", "/el",
+    "/chestplate", "/cp",
+    "/leggings",
+    "/boots", "/bt",
+    "/totem", "/ts",
+    "/ship", "/mansion", "/buried", "/ruin", "/monument",
+    "/igloo", "/portal",
+    "/villager", "/vil",
+    "/spawn", "/warden", "/wd", "/mobs",
+))
+
 
 def telegram_allows_admin_interaction(*, chat_type: str | None, chat_id: int | None, from_id: int | None) -> bool:
     """True only for a private DM with the bot where the sender is a listed admin."""
@@ -380,7 +452,7 @@ TOGGLE_KEYS = ("joins", "leaves", "approvals", "rejects", "restarts", "errors", 
 
 HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
 
-*Players*  /online · /activity · /status · /inventory `<p>`
+*Players*  /online · /activity · /status · /inventory `<p>` · /where `[p]`
 /kick `<p>` `[r]` · /msg `<p>` `<m>` · /ban `<p>` `[r]` · /pardon `<p>` · /banip `<t>` · /pardonip `<t>`
 
 *Whitelist & blocks*
@@ -398,7 +470,7 @@ HELP_TEXT = """🎮 *Vast Family Minecraft Bot*
 /settings — toggle which events ping you (joins, leaves, errors, chat, …)
 
 Plain text in this DM relays to in-game chat as `[Admin]`.
-Common aliases: /bu /rs /up /lg /wl /a /rm /bl /ub /ol /ac /st /inv /se /h"""
+Common aliases: /bu /rs /up /lg /wl /a /rm /bl /ub /ol /ac /st /inv /loc /se /h"""
 
 
 # Cheat-sheet of admin-only commands intentionally absent from HELP_TEXT.
@@ -438,11 +510,121 @@ HIDDEN_HELP_TEXT = """🤫 *Hidden admin commands* (admin-only, target `<player>
 /igloo — snowy igloo (~5 NE)
 /portal — ruined portal (biome variant chosen automatically)
 
+*Generic give*
+/give · /gv `<player>` `<item>` `[count]` — give any item id (default count 1)
+/items — cheat-sheet of common item ids (item ids are lowercase with underscores)
+
 *Mob*
 /villager · /vil `<player>` `[1-5]` — spawn villagers next to player
+/spawn `<player>` `<mob>` `[count]` — summon any entity near player (cap 10)
+/spawn `<player>` `raid` `[1-5]` — give Raid Omen to start a raid in a village
+/warden · /wd `<player>` `[count]` — shortcut: summon warden (extremely lethal)
+/mobs — cheat-sheet of common mob ids
 
 *This menu*
 /h\\_h"""
+
+
+# /spawn — cap on the spawn-count argument so /spawn Hannes warden 50
+# doesn't grief the world by accident. The owner gate is the real
+# safety, but a small cap prevents fat-finger spam too. The cap is
+# inclusive — count == MAX_SPAWN_COUNT is allowed.
+MAX_SPAWN_COUNT = 10
+
+# Radius from the target player where /spawn lands the mob. A warden on
+# the player's face is one-shot death before they can even read the
+# Telegram message announcing the spawn. 20 blocks is the practical
+# sweet spot: far enough to give them a moment, close enough that the
+# mob's awareness can still pick them up.
+SPAWN_DISTANCE_BLOCKS = 20
+
+
+def _random_spawn_offset(distance: int = SPAWN_DISTANCE_BLOCKS) -> tuple[int, int]:
+    """Return integer (dx, dz) for a point on a circle of `distance`
+    radius around the origin. Random angle every call so a
+    multi-mob /spawn run spreads the spawns around the player
+    instead of stacking them at one bearing. The Y component is
+    handled separately by Minecraft's `positioned over <heightmap>`
+    subcommand at summon time — vanilla can't 'find flat terrain'
+    on the bot side, but heightmap snapping is the closest thing:
+    the mob lands on the top non-leaf solid block at the chosen XZ
+    rather than floating in the air or appearing inside a wall."""
+    angle = random.uniform(0, 2 * math.pi)
+    dx = round(distance * math.cos(angle))
+    dz = round(distance * math.sin(angle))
+    return dx, dz
+
+
+# RCON output signals that mean the `summon` call failed in a way that
+# matters. Mirrors the GIVE_FAILURE_SIGNALS pattern so future regressions
+# (e.g. a Minecraft version that introduces a new wording for "Unknown
+# entity") are added in one place. /spawn uses this; the older
+# /villager command also implicitly relies on the same shape via its
+# own inline check.
+MOB_SPAWN_FAILURE_SIGNALS = (
+    "Entity not found",
+    "No entity was found",
+    "RCON error",
+    "Unknown or incomplete command",
+    "Failed to parse",
+    # Modern Minecraft phrasing for an unknown entity type
+    # (e.g. `/spawn Hannes wardn 1` → "Unknown entity type 'wardn'").
+    "Unknown entity",
+    # Defensive belt-and-braces — older / alt phrasing.
+    "Can't find element",
+)
+
+
+# /mobs cheat-sheet — Minecraft entity ids are lowercase with underscores
+# (`iron_golem`, not `IronGolem`). Curated rather than exhaustive — the
+# full registry includes ~140 entities and the wiki has the long tail.
+# Same markdown discipline as HIDDEN_HELP_TEXT and ITEMS_HELP_TEXT.
+MOBS_HELP_TEXT = """🧟 *Common mob / entity IDs* (lowercase, underscores)
+
+*Passive*: `villager` `cow` `pig` `sheep` `chicken` `horse` `donkey` `cat` `wolf` `fox` `rabbit` `parrot` `turtle` `axolotl` `bee` `frog` `allay` `camel` `sniffer`
+
+*Neutral*: `iron_golem` `snow_golem` `polar_bear` `panda` `dolphin` `goat` `wandering_trader`
+
+*Hostile (overworld)*: `zombie` `skeleton` `creeper` `spider` `cave_spider` `witch` `enderman` `slime` `husk` `stray` `drowned` `phantom` `pillager` `vindicator` `evoker` `vex` `ravager` `silverfish` `breeze` `bogged`
+
+*Nether*: `blaze` `ghast` `magma_cube` `wither_skeleton` `piglin` `piglin_brute` `zombified_piglin` `hoglin` `zoglin` `strider`
+
+*End*: `endermite` `shulker`
+
+*Bosses / dangerous*: `warden` `wither` `ender_dragon` `elder_guardian`
+
+*Water*: `guardian` `squid` `glow_squid` `tropical_fish` `cod` `salmon` `pufferfish`
+
+Shortcuts: `/warden <player>` summons a warden. `/spawn <player> raid [1-5]` gives Raid Omen to start a raid when the player is in a village. Full registry: minecraft.wiki/w/Mob"""
+
+
+# /items cheat-sheet — Minecraft item ids are lowercase with underscores
+# (`iron_ingot`, not `iron` or `Iron`). The list is intentionally curated
+# rather than exhaustive — a full vanilla registry is ~1500 entries and
+# fits poorly in a Telegram message. Items here are the ones admins
+# actually hand out; the wiki link covers everything else. Same markdown
+# discipline as HIDDEN_HELP_TEXT (balanced backticks / asterisks /
+# brackets) — every item is wrapped in a code span both for readability
+# and so Telegram doesn't try to italicize the underscores.
+ITEMS_HELP_TEXT = """🎁 *Common item IDs* (lowercase, underscores)
+
+*Materials*: `iron_ingot` `gold_ingot` `diamond` `netherite_ingot` `emerald` `copper_ingot` `coal` `charcoal` `redstone` `lapis_lazuli` `quartz` `amethyst_shard` `nether_star` `dragon_egg`
+
+*Food*: `cake` `enchanted_golden_apple` `golden_apple` `bread` `cooked_beef` `cooked_chicken` `cooked_porkchop` `golden_carrot`
+
+*Combat*: `shield` `tnt` `fire_charge` `ender_pearl` `snowball` `arrow` `spectral_arrow` `bow` `crossbow`
+
+*Special*: `totem_of_undying` `elytra` `enchanted_book` `end_crystal` `beacon` `conduit` `respawn_anchor`
+
+*Tools*: `shears` `fishing_rod` `brush` `spyglass` `lead` `name_tag` `compass` `clock`
+
+*Utility blocks*: `chest` `ender_chest` `shulker_box` `hopper` `dispenser` `observer` `piston` `redstone_torch` `repeater` `comparator`
+
+*Buckets*: `water_bucket` `lava_bucket` `milk_bucket` `bucket`
+
+*Wood / stone*: `oak_planks` `oak_log` `cobblestone` `stone` `obsidian` `glass` `glowstone`
+
+Full registry: type `/give @p ` in-game with tab-completion. Wiki: minecraft.wiki/w/Item"""
 
 
 def cmd_whitelist(chat_id: int):
@@ -475,11 +657,79 @@ def cmd_online(chat_id: int):
     out = rcon("list")
     send(chat_id, f"👥 *Online players*\n{md_escape(out)}")
 
-    if ":" not in out:
-        return
-    players = [p.strip() for p in out.rsplit(":", 1)[1].split(",") if p.strip()]
+    players = _parse_online_players(out)
     for player in players:
-        send(chat_id, f"`{md_escape(player)}`")
+        send(chat_id, f"`{player}`")
+
+def _parse_online_players(list_out: str) -> list[str]:
+    if ":" not in list_out:
+        return []
+    return [p.strip() for p in list_out.rsplit(":", 1)[1].split(",") if p.strip()]
+
+def cmd_give(chat_id: int, arg: str, admin_name: str):
+    """Generic `/give` wrapper for handing arbitrary items to a player.
+    Admin-only via the dispatcher gate. Hidden from /help; listed in /h_h.
+
+    Usage: `/give <player> <item> [count]` — count defaults to 1. Item id
+    can be vanilla shorthand (`diamond`) or fully qualified
+    (`minecraft:diamond_sword`); modern Minecraft `give` accepts both.
+
+    The item-id regex deliberately whitelists characters: letters, digits,
+    underscore, colon, slash, dash, dot. Whitespace and shell
+    metacharacters are excluded so a mistyped item can never smuggle a
+    second RCON command via the `give` argument. Failure signals from RCON
+    are surfaced verbatim so the operator sees exactly why the server
+    rejected the item, the player, or the count.
+    """
+    toks = arg.strip().split()
+    if len(toks) < 2:
+        send(chat_id, "Usage: `/give <player> <item> [count]` — e.g. `/give Elite_Eb diamond 32`")
+        return
+    player = toks[0]
+    item = toks[1]
+    count_str = toks[2] if len(toks) > 2 else "1"
+
+    if not MC_PROFILE_NAME.match(player):
+        send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
+        return
+
+    if not re.match(r"^[a-zA-Z0-9_:./-]{1,128}$", item):
+        send(chat_id, f"Invalid item id `{md_escape(item)}` — letters, digits, `_`, `:`, `.`, `/`, `-` only.")
+        return
+
+    try:
+        count = int(count_str)
+        if count < 1:
+            raise ValueError
+    except ValueError:
+        send(chat_id, f"Invalid count `{md_escape(count_str)}` — must be a positive integer.")
+        return
+
+    out = rcon(f"give {player} {item} {count}")
+    log.info("give %s x%d to %s by %s: %s", item, count, player, admin_name, out)
+    pe, ae, ie = md_escape(player), md_escape(admin_name), md_escape(item)
+    if any(sig in out for sig in GIVE_FAILURE_SIGNALS):
+        msg = f"❌ /give for *{pe}* failed:\n`{md_escape(out[:400])}`"
+        # Hint when the failure is specifically an unknown item id —
+        # the common cause is a player typing `iron` or `Iron` instead
+        # of `iron_ingot`. Point them at /items so they don't have to
+        # ask a second time.
+        if "Unknown item" in out or "Can't find element" in out:
+            msg += "\n\nItem ids are lowercase with underscores. Try `/items` for common ones."
+        send(chat_id, msg)
+        return
+    tail = md_escape(out) if out else "(no output)"
+    send(chat_id, f"🎁 Gave *{pe}* `{count}× {ie}` (by {ae}).\n`{tail}`")
+
+
+def cmd_items(chat_id: int):
+    """Send the curated common-item-id cheat-sheet. Hidden from /help;
+    listed under the *Generic give* section of /h_h. Static text — the
+    bot doesn't query the live Minecraft item registry, so item-set
+    changes after a Minecraft version bump need a manual update here.
+    The wiki link covers the long tail."""
+    send(chat_id, ITEMS_HELP_TEXT)
+
 
 def _split_snbt_compounds(raw: str) -> list[str]:
     """Return top-level item compounds from a Minecraft SNBT list."""
@@ -586,6 +836,70 @@ def cmd_inventory(chat_id: int, arg: str, admin_name: str):
         body = body[:3800] + "\n…truncated"
     log.info("inventory read for %s by %s: %d item slots", player, admin_name, len(items))
     send(chat_id, body)
+
+def _parse_entity_pos(raw: str) -> tuple[float, float, float] | None:
+    m = re.search(r"entity data:\s*\[([^\]]+)\]", raw)
+    if not m:
+        return None
+    nums = re.findall(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?(?=[dDfF]?\b)", m.group(1))
+    if len(nums) < 3:
+        return None
+    return (float(nums[0]), float(nums[1]), float(nums[2]))
+
+def _parse_entity_dimension(raw: str) -> str | None:
+    m = re.search(r'entity data:\s*"([^"]+)"', raw)
+    return m.group(1) if m else None
+
+def _realm_label(dimension: str | None) -> str:
+    labels = {
+        "minecraft:overworld": "Overworld",
+        "minecraft:the_nether": "Nether",
+        "minecraft:the_end": "The End",
+    }
+    if not dimension:
+        return "Unknown"
+    return labels.get(dimension, dimension.removeprefix("minecraft:").replace("_", " ").title())
+
+def _where_text_for_player(player: str) -> str:
+    if not MC_PROFILE_NAME.match(player):
+        return "Invalid player name (1–16 letters, digits, underscore)."
+
+    pos_out = rcon(f"data get entity {player} Pos")
+    if "No entity was found" in pos_out or "Found no elements" in pos_out or pos_out.startswith("RCON error:"):
+        return f"❌ Could not locate *{md_escape(player)}*:\n`{md_escape(pos_out[:800])}`"
+    pos = _parse_entity_pos(pos_out)
+    if pos is None:
+        return f"❌ Could not parse location for *{md_escape(player)}*:\n`{md_escape(pos_out[:800])}`"
+
+    dim_out = rcon(f"data get entity {player} Dimension")
+    dimension = _parse_entity_dimension(dim_out)
+    realm = _realm_label(dimension)
+    x, y, z = pos
+    dim_line = f"{md_escape(realm)} (`{dimension}`)" if dimension else md_escape(realm)
+    log.info("location read for %s: %s %.2f %.2f %.2f", player, dimension or "unknown", x, y, z)
+    return (
+        f"`{player}`\n"
+        f"Realm: {dim_line}\n"
+        f"XYZ: `{round(x)} {round(y)} {round(z)}`\n"
+        f"Exact: `{x:.2f}, {y:.2f}, {z:.2f}`"
+    )
+
+def cmd_where(chat_id: int, arg: str, admin_name: str):
+    player = arg.strip().split()[0] if arg.strip() else ""
+    if player:
+        send(chat_id, "📍 " + _where_text_for_player(player))
+        log.info("location command for %s by %s", player, admin_name)
+        return
+
+    players = _parse_online_players(rcon("list"))
+    if not players:
+        send(chat_id, "📍 No players online.")
+        return
+
+    send(chat_id, f"📍 *Online player locations* ({len(players)})")
+    for online_player in players:
+        send(chat_id, _where_text_for_player(online_player))
+    log.info("location command for all online players by %s: %d player(s)", admin_name, len(players))
 
 def cmd_activity(chat_id: int):
     try:
@@ -1265,6 +1579,166 @@ def cmd_villager(chat_id: int, arg: str, admin_name: str):
     pe, ae = md_escape(player), md_escape(admin_name)
     tail = md_escape(last_out) if last_out else "(no output)"
     send(chat_id, f"🧙 Spawned {count} villager(s) next to *{pe}* (by {ae}).\n`{tail}`")
+
+
+
+def cmd_raid(chat_id: int, arg: str, admin_name: str):
+    """Give Raid Omen level 1-5 to a target player.
+
+    Minecraft 1.21+ uses Raid Omen to start a raid when the player is in
+    a village. This is intentionally owner-gated via CHEAT_COMMANDS: it
+    is disruptive, but less brittle than trying to fabricate a raid from
+    low-level game internals.
+    """
+    toks = arg.strip().split()
+    if not toks:
+        send(chat_id, "Usage: `/spawn <player> raid [level]` — level 1–5")
+        return
+    player = toks[0]
+    level_str = toks[1] if len(toks) > 1 else "1"
+    if not MC_PROFILE_NAME.match(player):
+        send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
+        return
+    try:
+        level = int(level_str)
+    except ValueError:
+        send(chat_id, f"Raid level `{md_escape(level_str)}` must be a whole number 1–5.")
+        return
+    if level < 1 or level > 5:
+        send(chat_id, "Raid level must be between 1 and 5.")
+        return
+
+    amplifier = level - 1
+    out = rcon(f"effect give {player} minecraft:raid_omen 30 {amplifier} true")
+    log.info("raid omen level %d to %s by %s: %s", level, player, admin_name, out)
+    pe, ae = md_escape(player), md_escape(admin_name)
+    if any(sig in out for sig in MOB_SPAWN_FAILURE_SIGNALS):
+        send(chat_id, f"❌ /spawn raid for *{pe}* failed:\n`{md_escape(out[:400])}`")
+        return
+    tail = md_escape(out) if out else "(no output)"
+    send(
+        chat_id,
+        f"🚩 Gave *{pe}* Raid Omen level {level} (by {ae}). "
+        "A raid starts when they are in a village.\n"
+        f"`{tail}`",
+    )
+
+def cmd_spawn(chat_id: int, arg: str, admin_name: str):
+    """Generic mob spawner: `/spawn <player> <mob> [count]`. Summons N
+    copies of <mob> at the target player's position via
+    `execute at <player> run summon <mob> ~ ~ ~`. Hidden from /help;
+    listed in /h_h. Owner-gated through CHEAT_COMMANDS.
+
+    Entity-id whitelist mirrors the /give item-id whitelist —
+    `[a-zA-Z0-9_:./-]{1,128}` — so a mistyped mob id with a space or
+    semicolon can never smuggle a second RCON command onto the summon
+    line. Count is capped at MAX_SPAWN_COUNT to prevent fat-finger
+    griefing (10 wardens at once is rough on the world even when the
+    owner asked for it).
+    """
+    toks = arg.strip().split()
+    if len(toks) < 2:
+        send(chat_id, "Usage: `/spawn <player> <mob> [count]` — e.g. `/spawn Elite_Eb warden 1`")
+        return
+    player = toks[0]
+    mob = toks[1]
+    count_str = toks[2] if len(toks) > 2 else "1"
+
+    if not MC_PROFILE_NAME.match(player):
+        send(chat_id, "Invalid player name (1–16 letters, digits, underscore).")
+        return
+
+    if mob.lower() == "raid":
+        cmd_raid(chat_id, f"{player} {count_str}", admin_name)
+        return
+
+    if not re.match(r"^[a-zA-Z0-9_:./-]{1,128}$", mob):
+        send(chat_id, f"Invalid mob id `{md_escape(mob)}` — letters, digits, `_`, `:`, `.`, `/`, `-` only.")
+        return
+
+    try:
+        count = int(count_str)
+        if count < 1:
+            raise ValueError
+    except ValueError:
+        send(chat_id, f"Invalid count `{md_escape(count_str)}` — must be a positive integer.")
+        return
+    if count > MAX_SPAWN_COUNT:
+        send(chat_id, f"Count too high — capped at {MAX_SPAWN_COUNT} per /spawn call.")
+        return
+
+    # Each summon picks an independent random bearing so a `count=5`
+    # run scatters the mobs in a rough ring around the player rather
+    # than dropping all five at the same bearing. `positioned over
+    # motion_blocking_no_leaves` is what makes the mob land *on* the
+    # ground at that XZ — without it, summoning at `~dx ~ ~dz`
+    # would copy the player's Y, which is wrong for a player on a
+    # cliff or in a cave.
+    last_out = ""
+    for i in range(count):
+        dx, dz = _random_spawn_offset()
+        rcon_cmd = (
+            f"execute at {player} "
+            f"positioned ~{dx} ~ ~{dz} "
+            f"positioned over motion_blocking_no_leaves "
+            f"run summon {mob} ~ ~ ~"
+        )
+        out = rcon(rcon_cmd)
+        last_out = out
+        if any(sig in out for sig in MOB_SPAWN_FAILURE_SIGNALS):
+            log.warning("spawn %s aborted at %d/%d near %s by %s: %s",
+                        mob, i + 1, count, player, admin_name, out)
+            pe, me_, ae = md_escape(player), md_escape(mob), md_escape(admin_name)
+            msg = (
+                f"❌ Spawn of `{me_}` aborted at {i}/{count} for *{pe}* (by {ae}).\n"
+                f"`{md_escape(out[:400])}`"
+            )
+            # Hint when the cause is specifically an unknown entity id —
+            # parallel to /give's /items suggestion.
+            if "Unknown entity" in out or "Can't find element" in out:
+                msg += "\n\nEntity ids are lowercase with underscores. Try `/mobs` for common ones."
+            send(chat_id, msg)
+            return
+    log.info("spawn %s x%d near %s by %s: %s", mob, count, player, admin_name, last_out)
+    pe, me_, ae = md_escape(player), md_escape(mob), md_escape(admin_name)
+    tail = md_escape(last_out) if last_out else "(no output)"
+    send(
+        chat_id,
+        f"🧟 Spawned {count}× `{me_}` ~{SPAWN_DISTANCE_BLOCKS} blocks from *{pe}* "
+        f"(random bearing, on surface) by {ae}.\n`{tail}`",
+    )
+
+
+def cmd_warden(chat_id: int, arg: str, admin_name: str):
+    """Convenience: spawn a warden next to <player>. Equivalent to
+    `/spawn <player> warden [count]`. Hidden from /help.
+
+    Wardens one-shot most players through diamond armor and ignore most
+    forms of defense — this is the most lethal vanilla mob. The owner
+    gate is the only thing standing between this and chaos; the count
+    cap inherits MAX_SPAWN_COUNT but realistically nobody should ask
+    for more than 1.
+    """
+    toks = arg.strip().split()
+    if not toks or not toks[0]:
+        send(chat_id, "Usage: `/warden <player> [count]`")
+        return
+    player = toks[0]
+    count = toks[1] if len(toks) > 1 else "1"
+    # Reuse cmd_spawn by composing a synthetic arg string. Keeps the
+    # mob-id validation, count cap, and success/failure formatting in
+    # one place — and means a /spawn bugfix automatically benefits
+    # /warden.
+    cmd_spawn(chat_id, f"{player} warden {count}", admin_name)
+
+
+def cmd_mobs(chat_id: int):
+    """Send the curated common-mob-id cheat-sheet. Hidden from /help;
+    listed under the *Spawn mobs* section of /h_h. Static text — a
+    Minecraft version bump that introduces or removes mobs needs a
+    manual update to MOBS_HELP_TEXT; the wiki link covers the long
+    tail."""
+    send(chat_id, MOBS_HELP_TEXT)
 
 
 def cmd_whitelist_reload(chat_id: int, arg: str, admin_name: str):
@@ -2344,6 +2818,11 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     arg   = parts[1].strip() if len(parts) > 1 else ""
     log.info(f"Command {cmd} from {sender_name} ({chat_id})")
 
+    if cmd in CHEAT_COMMANDS and not is_cheat_owner(chat_id):
+        log.info("Cheat command %s refused for chat_id=%s (not in OWNER_CHAT_IDS)", cmd, chat_id)
+        send(chat_id, "⛔ That command is reserved for the server owner.")
+        return
+
     if   cmd in ("/help", "/h"):              send(chat_id, HELP_TEXT)
     elif cmd in ("/whitelist", "/wl"):        cmd_whitelist(chat_id)
     elif cmd in ("/approve", "/a"):           cmd_approve(chat_id, arg, sender_name)
@@ -2354,10 +2833,14 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd in ("/activity", "/ac"):         cmd_activity(chat_id)
     elif cmd in ("/status", "/st"):           cmd_status(chat_id)
     elif cmd in ("/inventory", "/inv"):       cmd_inventory(chat_id, arg, sender_name)
+    elif cmd in ("/where", "/loc"):           cmd_where(chat_id, arg, sender_name)
     elif cmd in ("/kick", "/k"):              cmd_kick(chat_id, arg, sender_name)
     elif cmd in ("/msg", "/tell"):            cmd_msg(chat_id, arg, sender_name)
     # /villager · /vil — admin-only, intentionally hidden from /help.
     elif cmd in ("/villager", "/vil"):        cmd_villager(chat_id, arg, sender_name)
+    elif cmd == "/spawn":                     cmd_spawn(chat_id, arg, sender_name)
+    elif cmd in ("/warden", "/wd"):           cmd_warden(chat_id, arg, sender_name)
+    elif cmd == "/mobs":                      cmd_mobs(chat_id)
     # /sword · /sw — admin-only god-sword giver, also hidden from /help.
     elif cmd in ("/sword", "/sw"):            cmd_sword(chat_id, arg, sender_name)
     # /pickaxe · /pk — admin-only god-pickaxe giver, also hidden from /help.
@@ -2375,6 +2858,8 @@ def handle_command(chat_id: int, text: str, sender_name: str):
     elif cmd == "/totem":                     cmd_totem(chat_id, arg, sender_name)
     # /ts — admin-only turtle-shell helmet giver, also hidden from /help.
     elif cmd == "/ts":                        cmd_turtle_shell(chat_id, arg, sender_name)
+    elif cmd in ("/give", "/gv"):             cmd_give(chat_id, arg, sender_name)
+    elif cmd == "/items":                     cmd_items(chat_id)
     # Hidden structure spawners. All admin-only via the dispatcher gate,
     # all absent from HELP_TEXT, all share _place_structure_near_player.
     elif cmd == "/ship":                      cmd_ship(chat_id, arg, sender_name)

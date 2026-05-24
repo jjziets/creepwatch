@@ -47,6 +47,7 @@ Long form and short alias both work.
 | `/online` | `/ol` | Who is online right now |
 | `/activity` | `/ac` | Last 20 join / leave / disconnect events |
 | `/status` | `/st` | Server version and player count |
+| `/where [player]` | `/loc` | Player coordinates and realm / dimension; no player prints everyone online |
 | `/kick <player>` | `/k` | Disconnect a player (optional kick message) |
 | `/msg <player> <msg>` | `/tell` | Whisper one player from the server (RCON `msg`) |
 | `/wlreload` | `/wlr` | `whitelist reload` after editing whitelist on disk |

@@ -207,6 +207,85 @@ class HiddenSwordCommandTest(unittest.TestCase):
         self.assertTrue(comp.endswith("}]"))
 
 
+class WhereCommandTest(unittest.TestCase):
+    def test_online_player_handles_are_copyable_without_escape_slashes(self):
+        sent = []
+
+        with patch.object(mc_guard, "rcon", return_value="There are 1 of a max of 20 players online: Elite_Eb"), patch.object(mc_guard, "send", side_effect=lambda _, text: sent.append(text)):
+            mc_guard.cmd_online(1)
+
+        self.assertEqual("`Elite_Eb`", sent[-1])
+
+    def test_parse_entity_pos_and_dimension(self):
+        pos = mc_guard._parse_entity_pos(
+            'LvictoryZ123 has the following entity data: [-445.17728899533097d, -3.0d, 1490.4432086034733d]'
+        )
+        self.assertEqual((-445.17728899533097, -3.0, 1490.4432086034733), pos)
+        self.assertEqual(
+            "minecraft:overworld",
+            mc_guard._parse_entity_dimension('LvictoryZ123 has the following entity data: "minecraft:overworld"'),
+        )
+        self.assertEqual("Overworld", mc_guard._realm_label("minecraft:overworld"))
+        self.assertEqual("Nether", mc_guard._realm_label("minecraft:the_nether"))
+        self.assertEqual("The End", mc_guard._realm_label("minecraft:the_end"))
+
+    def test_dispatcher_invokes_where(self):
+        with patch.object(mc_guard, "cmd_where") as spy:
+            mc_guard.handle_command(1, "/where Steve", "Op")
+            spy.assert_called_once_with(1, "Steve", "Op")
+
+    def test_dispatcher_invokes_where_alias(self):
+        with patch.object(mc_guard, "cmd_where") as spy:
+            mc_guard.handle_command(1, "/loc Alex", "Op")
+            spy.assert_called_once_with(1, "Alex", "Op")
+
+    def test_where_formats_realm_and_coordinates(self):
+        sent = []
+
+        def fake_rcon(cmd):
+            if cmd.endswith(" Pos"):
+                return 'Elite_Eb has the following entity data: [10.49d, 64.0d, -20.51d]'
+            if cmd.endswith(" Dimension"):
+                return 'Elite_Eb has the following entity data: "minecraft:the_nether"'
+            return ""
+
+        with patch.object(mc_guard, "rcon", side_effect=fake_rcon), patch.object(mc_guard, "send", side_effect=lambda _, text: sent.append(text)):
+            mc_guard.cmd_where(1, "Elite_Eb", "Op")
+
+        self.assertEqual(1, len(sent))
+        self.assertIn("`Elite_Eb`", sent[0])
+        self.assertNotIn("Elite\\_Eb", sent[0])
+        self.assertIn("Realm: Nether (`minecraft:the_nether`)", sent[0])
+        self.assertIn("XYZ: `10 64 -21`", sent[0])
+        self.assertIn("Exact: `10.49, 64.00, -20.51`", sent[0])
+
+    def test_where_without_player_prints_all_online_players(self):
+        sent = []
+
+        def fake_rcon(cmd):
+            if cmd == "list":
+                return "There are 2 of a max of 20 players online: Steve, Alex"
+            if cmd == "data get entity Steve Pos":
+                return 'Steve has the following entity data: [1.0d, 65.0d, 2.0d]'
+            if cmd == "data get entity Steve Dimension":
+                return 'Steve has the following entity data: "minecraft:overworld"'
+            if cmd == "data get entity Alex Pos":
+                return 'Alex has the following entity data: [-10.0d, 70.0d, 20.0d]'
+            if cmd == "data get entity Alex Dimension":
+                return 'Alex has the following entity data: "minecraft:the_end"'
+            return ""
+
+        with patch.object(mc_guard, "rcon", side_effect=fake_rcon), patch.object(mc_guard, "send", side_effect=lambda _, text: sent.append(text)):
+            mc_guard.cmd_where(1, "", "Op")
+
+        self.assertEqual(3, len(sent))
+        self.assertEqual("📍 *Online player locations* (2)", sent[0])
+        self.assertIn("`Steve`", sent[1])
+        self.assertIn("Realm: Overworld (`minecraft:overworld`)", sent[1])
+        self.assertIn("`Alex`", sent[2])
+        self.assertIn("Realm: The End (`minecraft:the_end`)", sent[2])
+
+
 class HiddenMansionCommandTest(unittest.TestCase):
     """/mansion spawns a woodland mansion 50 blocks NE of the target player.
     Admin-only, hidden from /help — same regression guards as /ship."""
@@ -283,14 +362,73 @@ class HiddenHelpMenuTest(unittest.TestCase):
         the cheat-sheet, that's a real regression — admins won't know
         the new command exists. Pin the list."""
         expected = (
+            "/give", "/items",
             "/sword", "/pickaxe", "/trident", "/bow", "/elytra",
             "/chestplate", "/leggings", "/boots", "/ts", "/totem",
             "/ship", "/mansion", "/buried", "/ruin", "/monument",
             "/igloo", "/portal", "/villager",
+            "/spawn", "/warden", "/mobs",
         )
         for cmd in expected:
             self.assertIn(cmd, mc_guard.HIDDEN_HELP_TEXT,
                           f"{cmd} missing from HIDDEN_HELP_TEXT")
+
+
+class HiddenGenericGiveAndSpawnTest(unittest.TestCase):
+    """The generic give/spawn helpers are owner-grade hidden commands.
+    They were previously lost during branch sync, so pin dispatcher
+    routing and the raid shortcut explicitly."""
+
+    CASES = (
+        ("/give Steve diamond 2", "cmd_give", (1, "Steve diamond 2", "Op")),
+        ("/gv Steve diamond 2", "cmd_give", (1, "Steve diamond 2", "Op")),
+        ("/items", "cmd_items", (1,)),
+        ("/spawn Steve ravager", "cmd_spawn", (1, "Steve ravager", "Op")),
+        ("/warden Steve", "cmd_warden", (1, "Steve", "Op")),
+        ("/wd Steve", "cmd_warden", (1, "Steve", "Op")),
+        ("/mobs", "cmd_mobs", (1,)),
+    )
+
+    def test_no_generic_cheat_command_leaks_into_help(self):
+        body = mc_guard.HELP_TEXT.lower()
+        for cmd_text, _fn_attr, _expected_args in self.CASES:
+            command = cmd_text.split()[0]
+            self.assertNotIn(command, body, f"{command} must not appear in HELP_TEXT")
+
+    def test_dispatcher_routes_generic_cheat_commands(self):
+        for cmd_text, fn_attr, expected_args in self.CASES:
+            with self.subTest(cmd=cmd_text):
+                with patch.object(mc_guard, fn_attr) as spy:
+                    mc_guard.handle_command(1, cmd_text, "Op")
+                    spy.assert_called_once_with(*expected_args)
+
+    def test_owner_gate_refuses_generic_cheat_command_for_non_owner(self):
+        with patch.object(mc_guard, "OWNER_CHAT_IDS", frozenset({999})), \
+             patch.object(mc_guard, "cmd_spawn") as spawn_spy, \
+             patch.object(mc_guard, "send") as send_spy:
+            mc_guard.handle_command(1, "/spawn Steve ravager", "Op")
+
+        spawn_spy.assert_not_called()
+        send_spy.assert_called_once()
+        self.assertIn("reserved for the server owner", send_spy.call_args.args[1])
+
+    def test_cmd_spawn_raid_gives_raid_omen_level(self):
+        with patch.object(mc_guard, "rcon", return_value="Applied effect minecraft:raid_omen to Steve") as rcon_spy, \
+             patch.object(mc_guard, "send") as send_spy:
+            mc_guard.cmd_spawn(1, "Steve raid 3", "Op")
+
+        rcon_spy.assert_called_once_with("effect give Steve minecraft:raid_omen 30 2 true")
+        sent = send_spy.call_args.args[1]
+        self.assertIn("Raid Omen level 3", sent)
+        self.assertIn("village", sent)
+
+    def test_cmd_spawn_raid_rejects_level_outside_one_to_five(self):
+        with patch.object(mc_guard, "rcon") as rcon_spy, \
+             patch.object(mc_guard, "send") as send_spy:
+            mc_guard.cmd_spawn(1, "Steve raid 6", "Op")
+
+        rcon_spy.assert_not_called()
+        self.assertIn("between 1 and 5", send_spy.call_args.args[1])
 
 
 class HiddenGearBatchTest(unittest.TestCase):
