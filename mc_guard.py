@@ -637,6 +637,8 @@ ITEMS_HELP_TEXT = """🎁 *Common item IDs* (lowercase, underscores)
 
 *Redstone*: `redstone` `redstone_torch` `repeater` `comparator`
 
+*Special blocks*: `honey_block` `slime_block` `magma_block` `soul_sand` `soul_soil` `crying_obsidian` `lodestone` `amethyst_block` `calcite` `tuff` `dripstone_block` `pointed_dripstone` `sculk` `sculk_sensor` `sculk_catalyst`
+
 *Buckets*: `water_bucket` `lava_bucket` `milk_bucket` `bucket`
 
 *Wood / stone*: `oak_planks` `oak_log` `cobblestone` `stone` `obsidian` `glass` `glowstone`
