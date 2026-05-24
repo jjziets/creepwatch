@@ -8,6 +8,8 @@ Minecraft Whitelist Guard Bot
 """
 import contextlib, subprocess, requests, time, re, logging, os, threading, pathlib, json, datetime, tempfile
 import gzip
+import math
+import random
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 

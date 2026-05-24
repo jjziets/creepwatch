@@ -500,6 +500,19 @@ class HiddenGenericGiveAndSpawnTest(unittest.TestCase):
         rcon_spy.assert_not_called()
         self.assertIn("between 1 and 5", send_spy.call_args.args[1])
 
+    def test_cmd_spawn_summons_generic_mob(self):
+        with patch.object(mc_guard, "_random_spawn_offset", return_value=(20, 0)), \
+             patch.object(mc_guard, "rcon", return_value="Summoned new Piglin Brute") as rcon_spy, \
+             patch.object(mc_guard, "send") as send_spy:
+            mc_guard.cmd_spawn(1, "Steve piglin_brute 2", "Op")
+
+        self.assertEqual(2, rcon_spy.call_count)
+        rcon_spy.assert_any_call(
+            "execute at Steve positioned ~20 ~ ~0 positioned over motion_blocking_no_leaves "
+            "run summon piglin_brute ~ ~ ~"
+        )
+        self.assertIn("Spawned 2× `piglin\\_brute`", send_spy.call_args.args[1])
+
 
 class CloakHoodTest(unittest.TestCase):
     def test_cloak_item_is_marked_carved_pumpkin(self):
